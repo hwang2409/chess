@@ -140,6 +140,20 @@ pub fn pseudo_legal_moves(position: &Position) -> Vec<Move> {
     moves
 }
 
+/// Returns whether the side to move has any legal move, stopping at the first one.
+pub fn has_legal_move(position: &mut Position) -> bool {
+    let us = position.side_to_move();
+    for mv in pseudo_legal_moves(position) {
+        let undo = position.make_move(mv);
+        let valid = !in_check(position, us);
+        position.unmake_move(mv, undo);
+        if valid {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn legal_moves(position: &mut Position) -> Vec<Move> {
     let us = position.side_to_move();
     let mut legal = Vec::new();
@@ -188,8 +202,22 @@ pub fn perft_divide(position: &mut Position, depth: u8) -> Vec<(Move, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{legal_moves, perft};
+    use super::{has_legal_move, legal_moves, perft};
     use crate::Position;
+
+    #[test]
+    fn legal_move_probe_matches_generation_and_preserves_position() {
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",
+            "7k/6Q1/6K1/8/8/8/8/8 b - - 0 1",
+        ] {
+            let mut p = Position::from_fen(fen).unwrap();
+            let original = p.clone();
+            assert_eq!(has_legal_move(&mut p), !legal_moves(&mut p).is_empty());
+            assert_eq!(p, original);
+        }
+    }
 
     #[test]
     fn start_position_perft() {

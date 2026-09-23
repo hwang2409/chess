@@ -1,6 +1,6 @@
 use crate::chess_move::Move;
 use crate::hash::repetition_key;
-use crate::movegen::{in_check, legal_moves};
+use crate::movegen::{has_legal_move, in_check, legal_moves};
 use crate::{Color, PieceKind, Position};
 use std::time::{Duration, Instant};
 
@@ -76,7 +76,7 @@ impl Searcher {
             };
             return result;
         }
-        if self.is_repetition() {
+        if self.is_repetition() || position.halfmove_clock() >= 100 {
             result.best_move = None;
             result.score = 0;
             return result;
@@ -123,19 +123,17 @@ impl Searcher {
         if self.expired() {
             return 0;
         }
-        if self.is_repetition() {
-            return 0;
-        }
-        if p.halfmove_clock() >= 100 {
-            return 0;
-        }
         if depth == 0 || ply >= MAX_PLY {
             return self.quiescence(p, alpha, beta, ply);
         }
+        // Checkmate and stalemate take precedence over draw claims at this node.
         let check = in_check(p, p.side_to_move());
         let moves = legal_moves(p);
         if moves.is_empty() {
             return if check { -MATE + ply as i32 } else { 0 };
+        }
+        if self.is_repetition() || p.halfmove_clock() >= 100 {
+            return 0;
         }
         let mut best = -INF;
         for mv in moves {
@@ -158,10 +156,25 @@ impl Searcher {
 
     fn quiescence(&mut self, p: &mut Position, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         self.nodes += 1;
-        if self.expired() || self.is_repetition() || p.halfmove_clock() >= 100 {
+        if self.expired() {
             return 0;
         }
         let check = in_check(p, p.side_to_move());
+        let moves = if check {
+            let moves = legal_moves(p);
+            if moves.is_empty() {
+                return -MATE + ply as i32;
+            }
+            Some(moves)
+        } else {
+            if !has_legal_move(p) {
+                return 0;
+            }
+            None
+        };
+        if self.is_repetition() || p.halfmove_clock() >= 100 {
+            return 0;
+        }
         let stand = evaluate(p);
         if !check {
             if stand >= beta {
@@ -172,10 +185,7 @@ impl Searcher {
         if ply >= MAX_PLY {
             return if check { stand } else { alpha };
         }
-        let moves = legal_moves(p);
-        if moves.is_empty() {
-            return if check { -MATE + ply as i32 } else { alpha };
-        }
+        let moves = moves.unwrap_or_else(|| legal_moves(p));
         for mv in moves {
             if !check && !self.is_capture(p, mv) && mv.promotion.is_none() {
                 continue;
@@ -332,10 +342,21 @@ mod tests {
     }
 
     #[test]
-    fn terminal_root_takes_precedence_over_repetition() {
+    fn root_halfmove_clock_draw_returns_no_move() {
+        let mut p =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 100 51")
+                .unwrap();
+        let result = Searcher::new().search_with_history(&mut p, 4, None, &[]);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+    }
+
+    #[test]
+    fn terminal_root_takes_precedence_over_repetition_and_halfmove_draw() {
         for (fen, expected_score) in [
-            ("7k/6Q1/6K1/8/8/8/8/8 b - - 8 1", -30_000),
-            ("7k/5Q2/6K1/8/8/8/8/8 b - - 8 1", 0),
+            ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -30_000),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 100 1", 0),
         ] {
             let mut p = Position::from_fen(fen).unwrap();
             let key = hash::repetition_key(&p);
@@ -344,6 +365,44 @@ mod tests {
             assert_eq!(result.score, expected_score);
             assert_eq!(result.best_move, None);
         }
+    }
+
+    #[test]
+    fn interior_terminal_positions_precede_repetition_and_halfmove_draws() {
+        for (fen, expected) in [
+            ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -29_996),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 100 1", 0),
+        ] {
+            let mut p = Position::from_fen(fen).unwrap();
+            let key = hash::repetition_key(&p);
+            let mut searcher = Searcher::new();
+            searcher.path = vec![key, key];
+            assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 4), expected);
+            assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 4), expected);
+        }
+    }
+
+    #[test]
+    fn quiescence_stalemate_precedes_draw_and_stand_pat_cutoff() {
+        let mut p = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 100 1").unwrap();
+        let original = p.clone();
+        let mut searcher = Searcher::new();
+        searcher.path = vec![hash::repetition_key(&p); 2];
+        assert_eq!(searcher.quiescence(&mut p, -32_000, -31_999, 1), 0);
+        assert_eq!(p, original);
+
+        let mut p = Position::startpos();
+        let mut searcher = Searcher::new();
+        let beta = 0;
+        assert_eq!(searcher.quiescence(&mut p, -32_000, beta, 1), beta);
+        assert_eq!(searcher.nodes, 1);
+    }
+
+    #[test]
+    fn quiescence_returns_draw_for_noncheck_stalemate() {
+        // Black to move is stalemated in this position.
+        let mut p = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert_eq!(Searcher::new().quiescence(&mut p, -32_000, 32_000, 1), 0);
     }
 
     #[test]
