@@ -40,11 +40,32 @@ impl Searcher {
         max_depth: u8,
         limit: Option<Duration>,
     ) -> SearchResult {
+        self.search_with_history(position, max_depth, limit, &[])
+    }
+
+    /// Search using repetition keys for game positions preceding `position`.
+    /// The current position is added internally, so history must exclude it.
+    pub fn search_with_history(
+        &mut self,
+        position: &mut Position,
+        max_depth: u8,
+        limit: Option<Duration>,
+        history: &[u64],
+    ) -> SearchResult {
         self.nodes = 0;
         self.aborted = false;
         self.deadline = limit.and_then(|d| Instant::now().checked_add(d));
         self.path.clear();
+        self.path.extend_from_slice(history);
         self.path.push(repetition_key(position));
+        if self.is_repetition() {
+            return SearchResult {
+                best_move: legal_moves(position).first().copied(),
+                score: 0,
+                depth: 0,
+                nodes: 0,
+            };
+        }
         let mut moves = legal_moves(position);
         moves.sort_by_key(|m| !self.is_capture(position, *m));
         let mut result = SearchResult {
@@ -177,9 +198,13 @@ impl Searcher {
     }
 
     fn is_repetition(&self) -> bool {
-        self.path
-            .last()
-            .is_some_and(|key| self.path[..self.path.len().saturating_sub(1)].contains(key))
+        self.path.last().is_some_and(|key| {
+            self.path
+                .iter()
+                .filter(|candidate| *candidate == key)
+                .count()
+                >= 3
+        })
     }
     fn is_capture(&self, p: &Position, mv: Move) -> bool {
         p.piece_at(mv.to).is_some()
@@ -274,6 +299,18 @@ mod tests {
         assert_eq!(hash::repetition_key(&p), start_rep);
         assert_ne!(p.zobrist_hash(), start_tt);
     }
+    #[test]
+    fn repetition_requires_three_occurrences_including_current_position() {
+        let mut p = Position::startpos();
+        let key = hash::repetition_key(&p);
+        let once = Searcher::new().search_with_history(&mut p, 1, None, &[key]);
+        assert_eq!(once.depth, 1);
+
+        let twice = Searcher::new().search_with_history(&mut p, 1, None, &[key, key]);
+        assert_eq!(twice.depth, 0);
+        assert_eq!(twice.score, 0);
+    }
+
     #[test]
     fn tiny_time_limit_still_returns_a_legal_fallback() {
         let mut p = Position::startpos();

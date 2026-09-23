@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rookery::Position;
 use rookery::chess_move::Move;
+use rookery::hash::repetition_key;
 use rookery::movegen::{legal_moves, perft_divide};
 use rookery::search::Searcher;
 
@@ -11,6 +12,7 @@ fn main() {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut position = Position::startpos();
     let mut searcher = Searcher::new();
+    let mut history = vec![repetition_key(&position)];
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let mut words = line.split_whitespace();
@@ -23,10 +25,14 @@ fn main() {
             "isready" => writeln!(stdout, "readyok").unwrap(),
             "ucinewgame" => {
                 position = Position::startpos();
+                history = vec![repetition_key(&position)];
                 searcher.clear();
             }
             "position" => match parse_position(&line) {
-                Ok(next) => position = next,
+                Ok((next, next_history)) => {
+                    position = next;
+                    history = next_history;
+                }
                 Err(error) => writeln!(stdout, "info string invalid position: {error}").unwrap(),
             },
             "go" => {
@@ -49,7 +55,12 @@ fn main() {
                         .unwrap_or(8)
                         .clamp(1, 32);
                     let time = search_time(&args, position.side_to_move());
-                    let result = searcher.search(&mut position, depth, time);
+                    let result = searcher.search_with_history(
+                        &mut position,
+                        depth,
+                        time,
+                        &history[..history.len().saturating_sub(1)],
+                    );
                     let score = if result.score.abs() > 29_000 {
                         let moves = (30_000 - result.score.abs() + 1) / 2;
                         format!("mate {}", if result.score < 0 { -moves } else { moves })
@@ -112,7 +123,7 @@ fn search_time(args: &[&str], side: rookery::Color) -> Option<Duration> {
     ))
 }
 
-fn parse_position(line: &str) -> Result<Position, String> {
+fn parse_position(line: &str) -> Result<(Position, Vec<u64>), String> {
     let words: Vec<_> = line.split_whitespace().collect();
     if words.len() < 2 {
         return Err("missing startpos or fen".into());
@@ -134,6 +145,7 @@ fn parse_position(line: &str) -> Result<Position, String> {
         }
         _ => return Err("expected startpos or fen".into()),
     };
+    let mut history = vec![repetition_key(&position)];
     if words.get(index) == Some(&"moves") {
         index += 1;
     }
@@ -144,6 +156,7 @@ fn parse_position(line: &str) -> Result<Position, String> {
             .find(|mv| *mv == requested)
             .ok_or_else(|| format!("illegal move {text}"))?;
         position.make_move(actual);
+        history.push(repetition_key(&position));
     }
-    Ok(position)
+    Ok((position, history))
 }
