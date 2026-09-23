@@ -1,6 +1,6 @@
 use crate::chess_move::Move;
 use crate::hash::repetition_key;
-use crate::movegen::{in_check, legal_moves};
+use crate::movegen::{has_legal_move, in_check, legal_moves};
 use crate::{Color, PieceKind, Position};
 use std::time::{Duration, Instant};
 
@@ -160,10 +160,18 @@ impl Searcher {
             return 0;
         }
         let check = in_check(p, p.side_to_move());
-        let moves = legal_moves(p);
-        if moves.is_empty() {
-            return if check { -MATE + ply as i32 } else { 0 };
-        }
+        let moves = if check {
+            let moves = legal_moves(p);
+            if moves.is_empty() {
+                return -MATE + ply as i32;
+            }
+            Some(moves)
+        } else {
+            if !has_legal_move(p) {
+                return 0;
+            }
+            None
+        };
         if self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
@@ -177,6 +185,7 @@ impl Searcher {
         if ply >= MAX_PLY {
             return if check { stand } else { alpha };
         }
+        let moves = moves.unwrap_or_else(|| legal_moves(p));
         for mv in moves {
             if !check && !self.is_capture(p, mv) && mv.promotion.is_none() {
                 continue;
@@ -371,6 +380,22 @@ mod tests {
             assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 4), expected);
             assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 4), expected);
         }
+    }
+
+    #[test]
+    fn quiescence_stalemate_precedes_draw_and_stand_pat_cutoff() {
+        let mut p = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 100 1").unwrap();
+        let original = p.clone();
+        let mut searcher = Searcher::new();
+        searcher.path = vec![hash::repetition_key(&p); 2];
+        assert_eq!(searcher.quiescence(&mut p, -32_000, -31_999, 1), 0);
+        assert_eq!(p, original);
+
+        let mut p = Position::startpos();
+        let mut searcher = Searcher::new();
+        let beta = 0;
+        assert_eq!(searcher.quiescence(&mut p, -32_000, beta, 1), beta);
+        assert_eq!(searcher.nodes, 1);
     }
 
     #[test]
