@@ -40,10 +40,25 @@ impl Searcher {
         max_depth: u8,
         limit: Option<Duration>,
     ) -> SearchResult {
+        self.search_with_history(position, max_depth, limit, &[])
+    }
+
+    /// Search using repetition keys for game positions preceding `position`.
+    /// The current position is added internally, so history must exclude it.
+    pub fn search_with_history(
+        &mut self,
+        position: &mut Position,
+        max_depth: u8,
+        limit: Option<Duration>,
+        history: &[u64],
+    ) -> SearchResult {
         self.nodes = 0;
         self.aborted = false;
         self.deadline = limit.and_then(|d| Instant::now().checked_add(d));
         self.path.clear();
+        let reversible_history_len = usize::from(position.halfmove_clock());
+        self.path
+            .extend_from_slice(&history[history.len().saturating_sub(reversible_history_len)..]);
         self.path.push(repetition_key(position));
         let mut moves = legal_moves(position);
         moves.sort_by_key(|m| !self.is_capture(position, *m));
@@ -59,6 +74,11 @@ impl Searcher {
             } else {
                 0
             };
+            return result;
+        }
+        if self.is_repetition() {
+            result.best_move = None;
+            result.score = 0;
             return result;
         }
         for depth in 1..=max_depth {
@@ -177,9 +197,13 @@ impl Searcher {
     }
 
     fn is_repetition(&self) -> bool {
-        self.path
-            .last()
-            .is_some_and(|key| self.path[..self.path.len().saturating_sub(1)].contains(key))
+        self.path.last().is_some_and(|key| {
+            self.path
+                .iter()
+                .filter(|candidate| *candidate == key)
+                .count()
+                >= 3
+        })
     }
     fn is_capture(&self, p: &Position, mv: Move) -> bool {
         p.piece_at(mv.to).is_some()
@@ -274,6 +298,54 @@ mod tests {
         assert_eq!(hash::repetition_key(&p), start_rep);
         assert_ne!(p.zobrist_hash(), start_tt);
     }
+    #[test]
+    fn repetition_requires_three_occurrences_in_reversible_suffix() {
+        let mut p = Position::startpos();
+        let key = hash::repetition_key(&p);
+        let mut history = vec![key];
+        for text in [
+            "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+        ] {
+            let mv = legal_moves(&mut p)
+                .into_iter()
+                .find(|m| m.to_string() == text)
+                .unwrap();
+            p.make_move(mv);
+            history.push(hash::repetition_key(&p));
+        }
+        history.pop(); // search adds the current position itself
+        let repeated = Searcher::new().search_with_history(&mut p, 1, None, &history);
+        assert_eq!(repeated.depth, 0);
+        assert_eq!(repeated.score, 0);
+        assert_eq!(repeated.best_move, None);
+
+        let mut p =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
+                .unwrap();
+        let key = hash::repetition_key(&p);
+        // These matching positions are in history before the pawn move; clock 0
+        // means none of that prefix can contribute to repetition.
+        let beyond_irreversible_prefix =
+            Searcher::new().search_with_history(&mut p, 1, None, &[key, key]);
+        assert_eq!(beyond_irreversible_prefix.depth, 1);
+        assert!(beyond_irreversible_prefix.best_move.is_some());
+    }
+
+    #[test]
+    fn terminal_root_takes_precedence_over_repetition() {
+        for (fen, expected_score) in [
+            ("7k/6Q1/6K1/8/8/8/8/8 b - - 8 1", -30_000),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 8 1", 0),
+        ] {
+            let mut p = Position::from_fen(fen).unwrap();
+            let key = hash::repetition_key(&p);
+            let result = Searcher::new().search_with_history(&mut p, 4, None, &[key, key]);
+            assert_eq!(result.depth, 0);
+            assert_eq!(result.score, expected_score);
+            assert_eq!(result.best_move, None);
+        }
+    }
+
     #[test]
     fn tiny_time_limit_still_returns_a_legal_fallback() {
         let mut p = Position::startpos();
