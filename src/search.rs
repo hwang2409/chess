@@ -385,6 +385,8 @@ mod tests {
     }
 
     #[test]
+    // Exercises both negamax and qsearch terminal-first behavior: mate remains a mate,
+    // and stalemate remains a draw, even when repetition and the 100-halfmove rule apply.
     fn interior_terminal_positions_precede_repetition_and_halfmove_draws() {
         for (fen, expected) in [
             ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -29_996),
@@ -413,6 +415,21 @@ mod tests {
         let beta = 0;
         assert_eq!(searcher.quiescence(&mut p, -32_000, beta, 1), beta);
         assert_eq!(searcher.nodes, 1);
+    }
+
+    #[test]
+    fn insufficient_material_stalemate_is_recognized_as_terminal_at_root_and_qsearch() {
+        // Black is stalemated; the lone bishop also qualifies as insufficient material.
+        let mut p = Position::from_fen("7k/5B2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert!(p.is_insufficient_material());
+        assert!(legal_moves(&mut p).is_empty());
+        let root = Searcher::new().search(&mut p, 2, None);
+        assert_eq!(root.score, 0);
+        assert_eq!(root.best_move, None);
+
+        let mut searcher = Searcher::new();
+        assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 1), 0);
+        assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 1), 0);
     }
 
     #[test]

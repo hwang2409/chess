@@ -414,6 +414,7 @@ mod tests {
             // c1 and g1 both have even file+rank parity.
             "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
             "4k3/8/8/8/8/8/8/3NK3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2B1K3 w - - 0 1",
             "4k3/8/8/8/8/8/8/2B1K1B1 w - - 0 1",
             // b1 and f1 both have odd file+rank parity, even across sides.
             "4k3/8/8/8/8/8/8/1b2KB2 w - - 0 1",
