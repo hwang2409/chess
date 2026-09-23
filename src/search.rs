@@ -123,6 +123,9 @@ impl Searcher {
         if self.expired() {
             return 0;
         }
+        if depth == 0 || ply >= MAX_PLY {
+            return self.quiescence(p, alpha, beta, ply);
+        }
         // Checkmate and stalemate take precedence over draw claims at this node.
         let check = in_check(p, p.side_to_move());
         let moves = legal_moves(p);
@@ -131,9 +134,6 @@ impl Searcher {
         }
         if self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
-        }
-        if depth == 0 || ply >= MAX_PLY {
-            return self.quiescence(p, alpha, beta, ply);
         }
         let mut best = -INF;
         for mv in moves {
