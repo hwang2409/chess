@@ -123,19 +123,17 @@ impl Searcher {
         if self.expired() {
             return 0;
         }
-        if self.is_repetition() {
-            return 0;
-        }
-        if p.halfmove_clock() >= 100 {
-            return 0;
-        }
-        if depth == 0 || ply >= MAX_PLY {
-            return self.quiescence(p, alpha, beta, ply);
-        }
+        // Checkmate and stalemate take precedence over draw claims at this node.
         let check = in_check(p, p.side_to_move());
         let moves = legal_moves(p);
         if moves.is_empty() {
             return if check { -MATE + ply as i32 } else { 0 };
+        }
+        if self.is_repetition() || p.halfmove_clock() >= 100 {
+            return 0;
+        }
+        if depth == 0 || ply >= MAX_PLY {
+            return self.quiescence(p, alpha, beta, ply);
         }
         let mut best = -INF;
         for mv in moves {
@@ -158,10 +156,17 @@ impl Searcher {
 
     fn quiescence(&mut self, p: &mut Position, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         self.nodes += 1;
-        if self.expired() || self.is_repetition() || p.halfmove_clock() >= 100 {
+        if self.expired() {
             return 0;
         }
         let check = in_check(p, p.side_to_move());
+        let moves = legal_moves(p);
+        if moves.is_empty() {
+            return if check { -MATE + ply as i32 } else { 0 };
+        }
+        if self.is_repetition() || p.halfmove_clock() >= 100 {
+            return 0;
+        }
         let stand = evaluate(p);
         if !check {
             if stand >= beta {
@@ -171,10 +176,6 @@ impl Searcher {
         }
         if ply >= MAX_PLY {
             return if check { stand } else { alpha };
-        }
-        let moves = legal_moves(p);
-        if moves.is_empty() {
-            return if check { -MATE + ply as i32 } else { alpha };
         }
         for mv in moves {
             if !check && !self.is_capture(p, mv) && mv.promotion.is_none() {
@@ -344,6 +345,28 @@ mod tests {
             assert_eq!(result.score, expected_score);
             assert_eq!(result.best_move, None);
         }
+    }
+
+    #[test]
+    fn interior_terminal_positions_precede_repetition_and_halfmove_draws() {
+        for (fen, expected) in [
+            ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -29_996),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 100 1", 0),
+        ] {
+            let mut p = Position::from_fen(fen).unwrap();
+            let key = hash::repetition_key(&p);
+            let mut searcher = Searcher::new();
+            searcher.path = vec![key, key];
+            assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 4), expected);
+            assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 4), expected);
+        }
+    }
+
+    #[test]
+    fn quiescence_returns_draw_for_noncheck_stalemate() {
+        // Black to move is stalemated in this position.
+        let mut p = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert_eq!(Searcher::new().quiescence(&mut p, -32_000, 32_000, 1), 0);
     }
 
     #[test]
