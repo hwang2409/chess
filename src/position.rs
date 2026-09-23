@@ -242,6 +242,7 @@ impl Position {
         if knights != 0 {
             return false;
         }
+        // Bit n is set when (file + rank) is odd: b1 is set, a1 is not.
         let light_squares = 0x55aa_55aa_55aa_55aau64;
         bishops & light_squares == 0 || bishops & !light_squares == 0
     }
@@ -391,11 +392,30 @@ mod tests {
         assert!(Position::from_fen("4k3/8/8/8/8/8/4p3/4K3 b - e5 0 1").is_err());
     }
     #[test]
+    fn bishop_square_color_mask_matches_file_rank_parity() {
+        let mask = 0x55aa_55aa_55aa_55aau64;
+        for (name, is_odd_parity) in [
+            ("a1", false),
+            ("b1", true),
+            ("c1", false),
+            ("a2", true),
+            ("b2", false),
+            ("h8", false),
+        ] {
+            let square = crate::Square::from_name(name).unwrap();
+            assert_eq!(mask & square.bit() != 0, is_odd_parity, "{name}");
+            assert_eq!(is_odd_parity, (square.file() + square.rank()) % 2 == 1);
+        }
+    }
+
+    #[test]
     fn insufficient_material_recognizes_only_supported_dead_positions() {
         for fen in [
+            // c1 and g1 both have even file+rank parity.
             "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
             "4k3/8/8/8/8/8/8/3NK3 w - - 0 1",
             "4k3/8/8/8/8/8/8/2B1K1B1 w - - 0 1",
+            // b1 and f1 both have odd file+rank parity, even across sides.
             "4k3/8/8/8/8/8/8/1b2KB2 w - - 0 1",
         ] {
             assert!(
@@ -404,6 +424,8 @@ mod tests {
             );
         }
         for fen in [
+            // c1 is even and f1 is odd: opposite-colored bishops must not draw.
+            "4k3/8/8/8/8/8/8/2b1KB2 w - - 0 1",
             "4k3/8/8/8/8/8/8/2NNK3 w - - 0 1",
             "4k3/8/8/8/8/8/8/2B1KBb1 w - - 0 1",
             "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
