@@ -76,7 +76,7 @@ impl Searcher {
             };
             return result;
         }
-        if self.is_repetition() {
+        if self.is_repetition() || position.halfmove_clock() >= 100 {
             result.best_move = None;
             result.score = 0;
             return result;
@@ -333,10 +333,21 @@ mod tests {
     }
 
     #[test]
-    fn terminal_root_takes_precedence_over_repetition() {
+    fn root_halfmove_clock_draw_returns_no_move() {
+        let mut p =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 100 51")
+                .unwrap();
+        let result = Searcher::new().search_with_history(&mut p, 4, None, &[]);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+    }
+
+    #[test]
+    fn terminal_root_takes_precedence_over_repetition_and_halfmove_draw() {
         for (fen, expected_score) in [
-            ("7k/6Q1/6K1/8/8/8/8/8 b - - 8 1", -30_000),
-            ("7k/5Q2/6K1/8/8/8/8/8 b - - 8 1", 0),
+            ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -30_000),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 100 1", 0),
         ] {
             let mut p = Position::from_fen(fen).unwrap();
             let key = hash::repetition_key(&p);
