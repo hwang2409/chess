@@ -26,4 +26,4 @@ The executable supports the basic UCI handshake, `position startpos` / `position
 - Search repetition tracking covers the current search path, not the complete game history supplied by the GUI. The UCI `position` command does not retain earlier game-position hashes for threefold claims.
 - Repetition identity currently includes the FEN en-passant file whenever present, even where no legal en-passant capture exists; strict FIDE repetition equivalence can therefore differ in edge cases.
 - FEN parsing checks field shape and en-passant rank but does not validate every chess-position invariant (for example, king counts, castling-right consistency, or reachability).
-- Draw adjudication is limited to repetition-path and 100-halfmove checks. Insufficient material, claimable-draw protocol behavior, and full game adjudication are not implemented.
+- Search adjudicates repetition-path and 100-halfmove draws, plus conservative insufficient-material positions (bare kings, a single minor piece, and bishops confined to one square color). Claimable-draw protocol behavior and full game adjudication are not implemented.

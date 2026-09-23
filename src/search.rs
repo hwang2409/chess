@@ -76,7 +76,10 @@ impl Searcher {
             };
             return result;
         }
-        if self.is_repetition() || position.halfmove_clock() >= 100 {
+        if position.is_insufficient_material()
+            || self.is_repetition()
+            || position.halfmove_clock() >= 100
+        {
             result.best_move = None;
             result.score = 0;
             return result;
@@ -132,7 +135,7 @@ impl Searcher {
         if moves.is_empty() {
             return if check { -MATE + ply as i32 } else { 0 };
         }
-        if self.is_repetition() || p.halfmove_clock() >= 100 {
+        if p.is_insufficient_material() || self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
         let mut best = -INF;
@@ -172,7 +175,7 @@ impl Searcher {
             }
             None
         };
-        if self.is_repetition() || p.halfmove_clock() >= 100 {
+        if p.is_insufficient_material() || self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
         let stand = evaluate(p);
@@ -339,6 +342,20 @@ mod tests {
             Searcher::new().search_with_history(&mut p, 1, None, &[key, key]);
         assert_eq!(beyond_irreversible_prefix.depth, 1);
         assert!(beyond_irreversible_prefix.best_move.is_some());
+    }
+
+    #[test]
+    fn insufficient_material_is_a_root_and_interior_search_draw() {
+        let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let result = Searcher::new().search(&mut p, 3, None);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+
+        let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let mut searcher = Searcher::new();
+        assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 1), 0);
+        assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 1), 0);
     }
 
     #[test]

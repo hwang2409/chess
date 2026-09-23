@@ -220,6 +220,32 @@ impl Position {
     pub fn zobrist_hash(&self) -> u64 {
         crate::hash::hash_position(self)
     }
+    /// Whether no legal continuation can produce checkmate due to the remaining material.
+    /// This intentionally recognizes only conservative, standard dead-position cases.
+    pub fn is_insufficient_material(&self) -> bool {
+        let pawns =
+            self.pieces(Color::White, PieceKind::Pawn) | self.pieces(Color::Black, PieceKind::Pawn);
+        let rooks =
+            self.pieces(Color::White, PieceKind::Rook) | self.pieces(Color::Black, PieceKind::Rook);
+        let queens = self.pieces(Color::White, PieceKind::Queen)
+            | self.pieces(Color::Black, PieceKind::Queen);
+        if pawns | rooks | queens != 0 {
+            return false;
+        }
+        let knights = self.pieces(Color::White, PieceKind::Knight)
+            | self.pieces(Color::Black, PieceKind::Knight);
+        let bishops = self.pieces(Color::White, PieceKind::Bishop)
+            | self.pieces(Color::Black, PieceKind::Bishop);
+        if bishops == 0 {
+            return knights.count_ones() <= 1;
+        }
+        if knights != 0 {
+            return false;
+        }
+        let light_squares = 0x55aa_55aa_55aa_55aau64;
+        bishops & light_squares == 0 || bishops & !light_squares == 0
+    }
+
     pub fn king_square(&self, color: Color) -> Option<Square> {
         let bb = self.pieces(color, PieceKind::King);
         if bb.count_ones() != 1 {
@@ -364,6 +390,34 @@ mod tests {
         assert!(Position::from_fen("4k3/8/8/8/4P3/8/8/4K3 w - e4 0 1").is_err());
         assert!(Position::from_fen("4k3/8/8/8/8/8/4p3/4K3 b - e5 0 1").is_err());
     }
+    #[test]
+    fn insufficient_material_recognizes_only_supported_dead_positions() {
+        for fen in [
+            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/3NK3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2B1K1B1 w - - 0 1",
+            "4k3/8/8/8/8/8/8/1b2KB2 w - - 0 1",
+        ] {
+            assert!(
+                Position::from_fen(fen).unwrap().is_insufficient_material(),
+                "{fen}"
+            );
+        }
+        for fen in [
+            "4k3/8/8/8/8/8/8/2NNK3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2B1KBb1 w - - 0 1",
+            "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/R3K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/Q3K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2B1KN2 w - - 0 1",
+        ] {
+            assert!(
+                !Position::from_fen(fen).unwrap().is_insufficient_material(),
+                "{fen}"
+            );
+        }
+    }
+
     #[test]
     fn make_unmake_restores_special_moves() {
         let mut p = Position::from_fen("r3k2r/P2p4/8/3pP3/8/8/8/R3K2R w KQkq d6 0 1").unwrap();
