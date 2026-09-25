@@ -6,6 +6,7 @@ use crate::search::Searcher;
 use crate::{Color, Position};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,6 +18,8 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024;
 const MAX_MOVE_BYTES: usize = 5;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_WORKERS: usize = 4;
+const CONNECTION_QUEUE_CAPACITY: usize = CONNECTION_WORKERS;
 const MIN_DEPTH: u8 = 1;
 const MAX_DEPTH: u8 = 6;
 
@@ -212,17 +215,98 @@ pub fn route(session: &mut GameSession, request: &Request) -> Response {
 pub fn serve(address: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(address)?;
     eprintln!("Rookery web board listening at http://{address}");
-    let session = Arc::new(Mutex::new(GameSession::new(3)));
+    let pool = ConnectionPool::new(Arc::new(Mutex::new(GameSession::new(3))));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let session = Arc::clone(&session);
-                thread::spawn(move || handle_connection(stream, session));
+                // Dropping an unadmitted stream immediately closes it. Do not let slow
+                // clients accumulate in an unbounded queue or create more threads.
+                let _ = pool.try_submit(stream);
             }
             Err(error) => eprintln!("web connection error: {error}"),
         }
     }
     Ok(())
+}
+
+struct ConnectionPool {
+    work: Option<SyncSender<TcpStream>>,
+    permits: Receiver<()>,
+    permit_sender: SyncSender<()>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ConnectionPool {
+    fn new(session: Arc<Mutex<GameSession>>) -> Self {
+        let (work, receiver) = mpsc::sync_channel(CONNECTION_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let (permit_sender, permits) = mpsc::sync_channel(CONNECTION_WORKERS);
+        for _ in 0..CONNECTION_WORKERS {
+            permit_sender
+                .send(())
+                .expect("newly-created permit channel must have capacity");
+        }
+
+        let mut workers = Vec::with_capacity(CONNECTION_WORKERS);
+        for _ in 0..CONNECTION_WORKERS {
+            let receiver = receiver.clone();
+            let session = Arc::clone(&session);
+            let permit_sender = permit_sender.clone();
+            workers.push(thread::spawn(move || {
+                loop {
+                    let stream = match receiver
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                    {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    handle_connection(stream, Arc::clone(&session));
+                    let _ = permit_sender.send(());
+                }
+            }));
+        }
+        Self {
+            work: Some(work),
+            permits,
+            permit_sender,
+            workers,
+        }
+    }
+
+    /// Returns false after closing `stream` when the bounded capacity is exhausted.
+    fn try_submit(&self, stream: TcpStream) -> bool {
+        debug_assert_eq!(self.workers.len(), CONNECTION_WORKERS);
+        let Some(work) = &self.work else {
+            return false;
+        };
+        if self.permits.try_recv().is_err() {
+            return false;
+        }
+        match work.try_send(stream) {
+            Ok(()) => true,
+            Err(TrySendError::Full(stream) | TrySendError::Disconnected(stream)) => {
+                // Return the permit if the work queue became unavailable.
+                let _ = self.permit_sender.send(());
+                drop(stream);
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    #[cfg(test)]
+    fn shutdown(mut self) {
+        drop(self.work.take());
+        for worker in self.workers {
+            worker.join().expect("connection worker must not panic");
+        }
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, session: Arc<Mutex<GameSession>>) {
@@ -570,29 +654,45 @@ mod tests {
     }
 
     #[test]
-    fn slow_client_does_not_block_another_connection() {
+    fn bounded_pool_rejects_excess_slow_clients_without_growing_workers() {
         use std::io::{Read, Write};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let slow_client = TcpStream::connect(address).unwrap();
-        let (slow_stream, _) = listener.accept().unwrap();
-        let session = Arc::new(Mutex::new(GameSession::new(1)));
-        let slow_session = Arc::clone(&session);
-        thread::spawn(move || handle_connection(slow_stream, slow_session));
+        let pool = ConnectionPool::new(Arc::new(Mutex::new(GameSession::new(1))));
+        assert_eq!(pool.worker_count(), CONNECTION_WORKERS);
 
-        let mut fast_client = TcpStream::connect(address).unwrap();
-        let (fast_stream, _) = listener.accept().unwrap();
-        let fast_session = Arc::clone(&session);
-        let worker = thread::spawn(move || handle_connection(fast_stream, fast_session));
-        fast_client
+        let mut slow_clients = Vec::new();
+        for _ in 0..CONNECTION_WORKERS - 1 {
+            let client = TcpStream::connect(address).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            assert!(pool.try_submit(stream));
+            slow_clients.push(client);
+        }
+
+        // This admitted client is a valid request, but waits to send it while all
+        // workers are occupied. Excess sockets must be closed instead of spawning
+        // workers or being queued without bound.
+        let mut valid_client = TcpStream::connect(address).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        assert!(pool.try_submit(stream));
+        for _ in 0..CONNECTION_WORKERS * 2 {
+            let excess_client = TcpStream::connect(address).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            assert!(!pool.try_submit(stream));
+            drop(excess_client);
+        }
+        assert_eq!(pool.worker_count(), CONNECTION_WORKERS);
+
+        valid_client
             .write_all(b"GET /api/state HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
         let mut response = String::new();
-        fast_client.read_to_string(&mut response).unwrap();
-        worker.join().unwrap();
-        drop(slow_client);
+        valid_client.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("\"fen\""));
+
+        drop(slow_clients);
+        pool.shutdown();
     }
 }
