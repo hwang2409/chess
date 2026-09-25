@@ -22,7 +22,7 @@ The executable supports the basic UCI handshake, `position startpos` / `position
 ## Known limitations
 
 - This is a correctness-oriented v0, not a competitive engine. Sliding attacks use ray walking; there are no magic bitboards, transposition table, move-ordering heuristics beyond captures, or opening book.
-- UCI search is synchronous; `stop` cannot interrupt a search while `go` is running. Time checks occur throughout recursive search, but time allocation is intentionally rudimentary.
+- UCI searches run on a worker thread so `stop` can cancel the active search. Time checks and cancellation checks occur throughout recursive search, but time allocation is intentionally rudimentary.
 - Search repetition tracking covers the current search path, not the complete game history supplied by the GUI. The UCI `position` command does not retain earlier game-position hashes for threefold claims.
 - Repetition identity currently includes the FEN en-passant file whenever present, even where no legal en-passant capture exists; strict FIDE repetition equivalence can therefore differ in edge cases.
 - FEN parsing checks field shape and en-passant rank but does not validate every chess-position invariant (for example, king counts, castling-right consistency, or reachability).

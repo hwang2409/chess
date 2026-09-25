@@ -2,6 +2,8 @@ use crate::chess_move::Move;
 use crate::hash::repetition_key;
 use crate::movegen::{has_legal_move, in_check, legal_moves};
 use crate::{Color, PieceKind, Position};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const INF: i32 = 32_000;
@@ -19,6 +21,7 @@ pub struct SearchResult {
 pub struct Searcher {
     nodes: u64,
     deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
     aborted: bool,
     path: Vec<u64>,
 }
@@ -28,6 +31,7 @@ impl Searcher {
         Self {
             nodes: 0,
             deadline: None,
+            cancelled: None,
             aborted: false,
             path: Vec::new(),
         }
@@ -52,9 +56,25 @@ impl Searcher {
         limit: Option<Duration>,
         history: &[u64],
     ) -> SearchResult {
+        self.search_with_history_cancelled(position, max_depth, limit, history, None)
+    }
+
+    /// Search using a cancellation flag shared with the command loop.
+    ///
+    /// The flag is read between search nodes; the position remains owned by this
+    /// searcher thread for the entire search.
+    pub fn search_with_history_cancelled(
+        &mut self,
+        position: &mut Position,
+        max_depth: u8,
+        limit: Option<Duration>,
+        history: &[u64],
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> SearchResult {
         self.nodes = 0;
         self.aborted = false;
         self.deadline = limit.and_then(|d| Instant::now().checked_add(d));
+        self.cancelled = cancelled;
         self.path.clear();
         let reversible_history_len = usize::from(position.halfmove_clock());
         self.path
@@ -223,7 +243,12 @@ impl Searcher {
                 && Some(mv.to) == p.en_passant_square())
     }
     fn expired(&mut self) -> bool {
-        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+        if self.deadline.is_some_and(|d| Instant::now() >= d)
+            || self
+                .cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
             self.aborted = true;
         }
         self.aborted
