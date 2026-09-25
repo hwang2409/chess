@@ -76,7 +76,10 @@ impl Searcher {
             };
             return result;
         }
-        if self.is_repetition() || position.halfmove_clock() >= 100 {
+        if position.is_insufficient_material()
+            || self.is_repetition()
+            || position.halfmove_clock() >= 100
+        {
             result.best_move = None;
             result.score = 0;
             return result;
@@ -132,7 +135,7 @@ impl Searcher {
         if moves.is_empty() {
             return if check { -MATE + ply as i32 } else { 0 };
         }
-        if self.is_repetition() || p.halfmove_clock() >= 100 {
+        if p.is_insufficient_material() || self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
         let mut best = -INF;
@@ -172,7 +175,7 @@ impl Searcher {
             }
             None
         };
-        if self.is_repetition() || p.halfmove_clock() >= 100 {
+        if p.is_insufficient_material() || self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
         let stand = evaluate(p);
@@ -342,6 +345,20 @@ mod tests {
     }
 
     #[test]
+    fn insufficient_material_is_a_root_and_interior_search_draw() {
+        let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let result = Searcher::new().search(&mut p, 3, None);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+
+        let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let mut searcher = Searcher::new();
+        assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 1), 0);
+        assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 1), 0);
+    }
+
+    #[test]
     fn root_halfmove_clock_draw_returns_no_move() {
         let mut p =
             Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 100 51")
@@ -368,6 +385,8 @@ mod tests {
     }
 
     #[test]
+    // Exercises both negamax and qsearch terminal-first behavior: mate remains a mate,
+    // and stalemate remains a draw, even when repetition and the 100-halfmove rule apply.
     fn interior_terminal_positions_precede_repetition_and_halfmove_draws() {
         for (fen, expected) in [
             ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -29_996),
@@ -396,6 +415,21 @@ mod tests {
         let beta = 0;
         assert_eq!(searcher.quiescence(&mut p, -32_000, beta, 1), beta);
         assert_eq!(searcher.nodes, 1);
+    }
+
+    #[test]
+    fn insufficient_material_stalemate_is_recognized_as_terminal_at_root_and_qsearch() {
+        // Black is stalemated; the lone bishop also qualifies as insufficient material.
+        let mut p = Position::from_fen("7k/5B2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert!(p.is_insufficient_material());
+        assert!(legal_moves(&mut p).is_empty());
+        let root = Searcher::new().search(&mut p, 2, None);
+        assert_eq!(root.score, 0);
+        assert_eq!(root.best_move, None);
+
+        let mut searcher = Searcher::new();
+        assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 1), 0);
+        assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 1), 0);
     }
 
     #[test]
