@@ -497,6 +497,20 @@ mod tests {
     }
 
     #[test]
+    fn repetition_history_ignores_an_unavailable_en_passant_target() {
+        let mut with_target = Position::from_fen("4k3/8/8/3p4/8/8/8/4K3 w - d6 2 1").unwrap();
+        let without_target = Position::from_fen("4k3/8/8/3p4/8/8/8/4K3 w - - 2 1").unwrap();
+        let key = hash::repetition_key(&without_target);
+
+        // The two preceding equivalent positions plus the current position
+        // are a threefold repetition even though this FEN carries d6.
+        let result = Searcher::new().search_with_history(&mut with_target, 2, None, &[key, key]);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+    }
+
+    #[test]
     fn insufficient_material_is_a_root_and_interior_search_draw() {
         let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
         let result = Searcher::new().search(&mut p, 3, None);
