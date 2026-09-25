@@ -56,6 +56,11 @@ fn rejects_malformed_fen_fields() {
             "invalid castling rights",
         ),
         (
+            "duplicate castling right",
+            "8/8/8/8/8/8/8/8 w KK - 0 1",
+            "duplicate castling right",
+        ),
+        (
             "invalid en-passant square",
             "8/8/8/8/8/8/8/8 w - i6 0 1",
             "invalid en-passant square",
