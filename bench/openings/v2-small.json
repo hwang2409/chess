@@ -1,0 +1,9 @@
+{
+  "format": "rookery-v2-opening-suite-v1",
+  "openings": [
+    {"id": "startpos", "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"},
+    {"id": "open-game", "fen": "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 3"},
+    {"id": "queens-gambit", "fen": "rnbqkbnr/pp2pppp/8/2pp4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"},
+    {"id": "sicilian", "fen": "rnbqkbnr/pp2pppp/8/2pp4/4P3/2N5/PPPP1PPP/R1BQKBNR w KQkq - 0 3"}
+  ]
+}

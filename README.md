@@ -39,3 +39,14 @@ Then open [http://127.0.0.1:7878](http://127.0.0.1:7878). The board is a self-co
 - FEN parsing validates field structure, piece placement syntax, canonical castling-field spelling, counters, and en-passant rank, but does not validate all chess-position invariants, castling-piece consistency, or reachability.
 - Draw adjudication is engine behavior rather than full claimable-draw protocol support. Insufficient-material recognition is intentionally conservative (bare kings, a single minor, or bishops all on one square color); broader dead-position analysis is not implemented.
 - The engine tracks repetition history supplied through the current UCI `position` command and the search path. It has no persistent game database or recovery of history omitted by a GUI.
+
+## V2 benchmarking and roadmap
+
+The dependency-free Python UCI gauntlet in [`docs/v2-benchmark.md`](docs/v2-benchmark.md) runs Rookery against Stockfish or another UCI engine from a committed color-paired FEN suite, records each game as JSONL/PGN-like data, and emits a machine-readable W/D/L report. It has no Stockfish requirement for repository tests; Rookery can play itself in the documented smoke mode.
+
+V2 optimization work is deliberately benchmark-led and prioritized as follows:
+
+1. **Movement speed:** profile and improve move generation/make-unmake and sliding attacks while retaining perft correctness.
+2. **Search ordering and selectivity:** strengthen ordering, iterative-search information, pruning/reductions, and transposition-table use with tactical regression coverage.
+3. **Evaluation:** improve calibrated positional evaluation and testing before increasing complexity.
+4. **Later NNUE and parallelism:** consider an NNUE evaluator and parallel search only after the preceding measurements establish a stable baseline and correctness/performance trade-offs.
