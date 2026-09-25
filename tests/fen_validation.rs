@@ -61,6 +61,21 @@ fn rejects_malformed_fen_fields() {
             "duplicate castling right",
         ),
         (
+            "out-of-order white castling rights",
+            "8/8/8/8/8/8/8/8 w QK - 0 1",
+            "castling rights must be in canonical KQkq order",
+        ),
+        (
+            "out-of-order black castling rights",
+            "8/8/8/8/8/8/8/8 w qk - 0 1",
+            "castling rights must be in canonical KQkq order",
+        ),
+        (
+            "out-of-order castling colors",
+            "8/8/8/8/8/8/8/8 w kQ - 0 1",
+            "castling rights must be in canonical KQkq order",
+        ),
+        (
             "invalid en-passant square",
             "8/8/8/8/8/8/8/8 w - i6 0 1",
             "invalid en-passant square",
