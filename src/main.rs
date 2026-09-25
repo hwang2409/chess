@@ -1,20 +1,121 @@
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rookery::Position;
 use rookery::chess_move::Move;
 use rookery::hash::repetition_key;
 use rookery::movegen::{legal_moves, perft_divide};
-use rookery::search::Searcher;
+use rookery::search::{SearchResult, Searcher};
+
+struct ActiveSearch {
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<SearchResult>,
+    worker: JoinHandle<()>,
+}
+
+enum ActiveEvent {
+    Command(String),
+    Result(SearchResult),
+    Empty,
+    CommandsDisconnected,
+}
+
+/// Commands take precedence over a completed search result. This prevents a
+/// queued `quit` from being overtaken by the worker's final response.
+fn poll_active_event(commands: &Receiver<String>, search: &ActiveSearch) -> ActiveEvent {
+    match commands.try_recv() {
+        Ok(command) => ActiveEvent::Command(command),
+        Err(mpsc::TryRecvError::Empty) => match search.result.try_recv() {
+            Ok(result) => ActiveEvent::Result(result),
+            Err(_) => ActiveEvent::Empty,
+        },
+        // Once stdin is closed no further command can overtake the result, so
+        // reap a completed worker instead of repeatedly reporting disconnect.
+        Err(mpsc::TryRecvError::Disconnected) => match search.result.try_recv() {
+            Ok(result) => ActiveEvent::Result(result),
+            Err(_) => ActiveEvent::CommandsDisconnected,
+        },
+    }
+}
 
 fn main() {
-    let stdin = io::stdin();
+    let (commands, command_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if commands.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut position = Position::startpos();
-    let mut searcher = Searcher::new();
     let mut history = vec![repetition_key(&position)];
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    let mut active: Option<ActiveSearch> = None;
+    let mut deferred = VecDeque::new();
+    let mut quitting = false;
+
+    loop {
+        // `quit` cancels an active search. Do not dispatch queued commands
+        // while waiting for that worker to finish; they must not emit output
+        // after quit has been accepted.
+        if quitting {
+            if let Some(search) = active.take() {
+                search.worker.join().unwrap();
+            }
+            break;
+        }
+
+        let command = if let Some(search) = active.as_ref() {
+            match poll_active_event(&command_receiver, search) {
+                ActiveEvent::Command(command) => Some(command),
+                ActiveEvent::Result(result) => {
+                    let search = active.take().unwrap();
+                    search.worker.join().unwrap();
+                    if quitting {
+                        break;
+                    }
+                    write_search_result(&mut stdout, result);
+                    stdout.flush().unwrap();
+                    continue;
+                }
+                ActiveEvent::CommandsDisconnected => {
+                    search.cancelled.store(true, Ordering::Relaxed);
+                    quitting = true;
+                    None
+                }
+                ActiveEvent::Empty => {
+                    match command_receiver.recv_timeout(Duration::from_millis(10)) {
+                        Ok(command) => Some(command),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            if let Some(search) = active.as_ref() {
+                                search.cancelled.store(true, Ordering::Relaxed);
+                            }
+                            quitting = true;
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            deferred
+                .pop_front()
+                .or_else(|| command_receiver.recv().ok())
+        };
+        let Some(line) = command else {
+            if active.is_none() {
+                break;
+            }
+            continue;
+        };
+
         let mut words = line.split_whitespace();
         match words.next().unwrap_or("") {
             "uci" => {
@@ -23,19 +124,18 @@ fn main() {
                 writeln!(stdout, "uciok").unwrap();
             }
             "isready" => writeln!(stdout, "readyok").unwrap(),
-            "ucinewgame" => {
+            "ucinewgame" if active.is_none() => {
                 position = Position::startpos();
                 history = vec![repetition_key(&position)];
-                searcher.clear();
             }
-            "position" => match parse_position(&line) {
+            "position" if active.is_none() => match parse_position(&line) {
                 Ok((next, next_history)) => {
                     position = next;
                     history = next_history;
                 }
                 Err(error) => writeln!(stdout, "info string invalid position: {error}").unwrap(),
             },
-            "go" => {
+            "go" if active.is_none() => {
                 let args: Vec<_> = line.split_whitespace().skip(1).collect();
                 if let Some(i) = args.iter().position(|arg| *arg == "perft") {
                     let depth = args
@@ -50,46 +150,79 @@ fn main() {
                     writeln!(stdout, "nodes {total}").unwrap();
                     writeln!(stdout, "bestmove 0000").unwrap();
                 } else {
-                    let depth = value_after(&args, "depth")
-                        .and_then(|v| v.parse::<u8>().ok())
-                        .unwrap_or(8)
-                        .clamp(1, 32);
-                    let time = search_time(&args, position.side_to_move());
-                    let result = searcher.search_with_history(
-                        &mut position,
-                        depth,
-                        time,
-                        &history[..history.len().saturating_sub(1)],
-                    );
-                    let score = if result.score.abs() > 29_000 {
-                        let moves = (30_000 - result.score.abs() + 1) / 2;
-                        format!("mate {}", if result.score < 0 { -moves } else { moves })
-                    } else {
-                        format!("cp {}", result.score)
-                    };
-                    writeln!(
-                        stdout,
-                        "info depth {} score {} nodes {}",
-                        result.depth, score, result.nodes
-                    )
-                    .unwrap();
-                    writeln!(
-                        stdout,
-                        "bestmove {}",
-                        result
-                            .best_move
-                            .map_or("0000".to_string(), |m| m.to_string())
-                    )
-                    .unwrap();
+                    active = Some(start_search(&position, &history, &args));
                 }
             }
-            "stop" => {}
-            "quit" => break,
+            "stop" => {
+                if let Some(search) = active.as_ref() {
+                    search.cancelled.store(true, Ordering::Relaxed);
+                }
+            }
+            "quit" => {
+                if let Some(search) = active.as_ref() {
+                    search.cancelled.store(true, Ordering::Relaxed);
+                    quitting = true;
+                } else {
+                    break;
+                }
+            }
+            "ucinewgame" | "position" | "go" => deferred.push_back(line),
             "" => {}
             _ => {}
         }
         stdout.flush().unwrap();
     }
+}
+
+fn start_search(position: &Position, history: &[u64], args: &[&str]) -> ActiveSearch {
+    let depth = value_after(args, "depth")
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32);
+    let time = search_time(args, position.side_to_move());
+    let mut search_position = position.clone();
+    let search_history = history[..history.len().saturating_sub(1)].to_vec();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let search_cancelled = Arc::clone(&cancelled);
+    let (result_sender, result) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let result = Searcher::new().search_with_history_cancelled(
+            &mut search_position,
+            depth,
+            time,
+            &search_history,
+            Some(search_cancelled),
+        );
+        let _ = result_sender.send(result);
+    });
+    ActiveSearch {
+        cancelled,
+        result,
+        worker,
+    }
+}
+
+fn write_search_result(stdout: &mut impl Write, result: SearchResult) {
+    let score = if result.score.abs() > 29_000 {
+        let moves = (30_000 - result.score.abs() + 1) / 2;
+        format!("mate {}", if result.score < 0 { -moves } else { moves })
+    } else {
+        format!("cp {}", result.score)
+    };
+    writeln!(
+        stdout,
+        "info depth {} score {} nodes {}",
+        result.depth, score, result.nodes
+    )
+    .unwrap();
+    writeln!(
+        stdout,
+        "bestmove {}",
+        result
+            .best_move
+            .map_or("0000".to_string(), |m| m.to_string())
+    )
+    .unwrap();
 }
 
 fn value_after<'a>(args: &'a [&str], key: &str) -> Option<&'a str> {
@@ -159,4 +292,35 @@ fn parse_position(line: &str) -> Result<(Position, Vec<u64>), String> {
         history.push(repetition_key(&position));
     }
     Ok((position, history))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_quit_precedes_a_completed_search_result() {
+        let (command_sender, commands) = mpsc::channel();
+        let (result_sender, result) = mpsc::sync_channel(1);
+        command_sender.send("quit".to_string()).unwrap();
+        result_sender
+            .send(SearchResult {
+                best_move: None,
+                score: 0,
+                depth: 0,
+                nodes: 0,
+            })
+            .unwrap();
+        let search = ActiveSearch {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            result,
+            worker: thread::spawn(|| {}),
+        };
+
+        assert!(matches!(
+            poll_active_event(&commands, &search),
+            ActiveEvent::Command(command) if command == "quit"
+        ));
+        search.worker.join().unwrap();
+    }
 }
