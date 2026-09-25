@@ -4,14 +4,19 @@ use crate::hash::repetition_key;
 use crate::movegen::{in_check, legal_moves};
 use crate::search::Searcher;
 use crate::{Color, Position};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 const INDEX: &str = include_str!("../web/index.html");
 const STYLE: &str = include_str!("../web/style.css");
 const APP: &str = include_str!("../web/app.js");
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024;
+const MAX_MOVE_BYTES: usize = 5;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_DEPTH: u8 = 1;
 const MAX_DEPTH: u8 = 6;
 
@@ -207,15 +212,12 @@ pub fn route(session: &mut GameSession, request: &Request) -> Response {
 pub fn serve(address: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(address)?;
     eprintln!("Rookery web board listening at http://{address}");
-    let mut session = GameSession::new(3);
+    let session = Arc::new(Mutex::new(GameSession::new(3)));
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                let response = match read_request(&mut stream) {
-                    Ok(request) => route(&mut session, &request),
-                    Err(message) => Response::error(400, &message),
-                };
-                let _ = write_response(&mut stream, &response);
+            Ok(stream) => {
+                let session = Arc::clone(&session);
+                thread::spawn(move || handle_connection(stream, session));
             }
             Err(error) => eprintln!("web connection error: {error}"),
         }
@@ -223,16 +225,29 @@ pub fn serve(address: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn handle_connection(mut stream: TcpStream, session: Arc<Mutex<GameSession>>) {
+    let _ = stream.set_read_timeout(Some(CONNECTION_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONNECTION_TIMEOUT));
+    let response = match read_request(&mut stream) {
+        Ok(request) => {
+            let mut session = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            route(&mut session, &request)
+        }
+        Err(message) => Response::error(400, &message),
+    };
+    let _ = write_response(&mut stream, &response);
+}
+
 pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
-    let mut reader = BufReader::new(stream);
-    let mut first = String::new();
-    reader
-        .read_line(&mut first)
-        .map_err(|_| "Could not read request.".to_owned())?;
-    if first.len() > MAX_HEADER_BYTES {
-        return Err("Request header is too large.".to_owned());
-    }
-    let mut parts = first.split_whitespace();
+    let mut header_bytes = 0;
+    let first = read_header_line(stream, &mut header_bytes)?;
+    let first =
+        std::str::from_utf8(&first).map_err(|_| "Request header must be UTF-8.".to_owned())?;
+    let mut parts = first
+        .trim_end_matches(['\r', '\n'])
+        .split_ascii_whitespace();
     let method = parts
         .next()
         .ok_or_else(|| "Malformed request line.".to_owned())?;
@@ -251,34 +266,38 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
     {
         return Err("Malformed request.".to_owned());
     }
+
     let mut content_length = 0usize;
-    let mut bytes = first.len();
+    let mut saw_content_length = false;
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|_| "Could not read request.".to_owned())?;
-        bytes += line.len();
-        if bytes > MAX_HEADER_BYTES {
-            return Err("Request header is too large.".to_owned());
-        }
-        if line == "\r\n" || line == "\n" {
+        let line = read_header_line(stream, &mut header_bytes)?;
+        if line == b"\r\n" || line == b"\n" {
             break;
         }
-        if let Some((name, value)) = line.trim_end().split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| "Request header must be UTF-8.".to_owned())?
+            .trim_end_matches(['\r', '\n']);
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "Malformed request header.".to_owned())?;
+        if name.eq_ignore_ascii_case("content-length") {
+            if saw_content_length {
+                return Err("Duplicate Content-Length.".to_owned());
+            }
+            saw_content_length = true;
             content_length = value
                 .trim()
                 .parse()
                 .map_err(|_| "Invalid Content-Length.".to_owned())?;
+            if content_length > MAX_BODY_BYTES {
+                return Err("Request body is too large.".to_owned());
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err("Transfer-Encoding is not supported.".to_owned());
         }
     }
-    if content_length > MAX_BODY_BYTES {
-        return Err("Request body is too large.".to_owned());
-    }
     let mut body = vec![0; content_length];
-    reader
+    stream
         .read_exact(&mut body)
         .map_err(|_| "Incomplete request body.".to_owned())?;
     let body = String::from_utf8(body).map_err(|_| "Request body must be UTF-8.".to_owned())?;
@@ -287,6 +306,24 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
         path: path.to_owned(),
         body,
     })
+}
+
+fn read_header_line(stream: &mut TcpStream, total: &mut usize) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    loop {
+        if *total >= MAX_HEADER_BYTES {
+            return Err("Request header is too large.".to_owned());
+        }
+        let mut byte = [0];
+        stream
+            .read_exact(&mut byte)
+            .map_err(|_| "Could not read request.".to_owned())?;
+        *total += 1;
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+    }
 }
 
 fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
@@ -327,32 +364,99 @@ fn clamp_depth(depth: u8) -> u8 {
 }
 
 fn json_string_field(body: &str, name: &str) -> Option<String> {
-    let marker = format!(r#""{name}""#);
-    let rest = body
-        .trim()
-        .strip_prefix('{')?
-        .strip_suffix('}')?
-        .split_once(&marker)?
-        .1;
-    let value = rest.trim_start().strip_prefix(':')?.trim_start();
-    let text = value.strip_prefix('"')?.split('"').next()?;
-    if text.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        Some(text.to_ascii_lowercase())
-    } else {
-        None
+    let mut parser = JsonParser::new(body);
+    parser.whitespace();
+    parser.byte(b'{')?;
+    parser.whitespace();
+    let key = parser.string(name.len())?;
+    if key != name {
+        return None;
     }
+    parser.whitespace();
+    parser.byte(b':')?;
+    parser.whitespace();
+    let value = parser.string(MAX_MOVE_BYTES)?;
+    parser.whitespace();
+    parser.byte(b'}')?;
+    parser.whitespace();
+    if !parser.at_end() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
 }
 
 fn json_number_field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
-    let marker = format!(r#""{name}""#);
-    let rest = body
-        .trim()
-        .strip_prefix('{')?
-        .strip_suffix('}')?
-        .split_once(&marker)?
-        .1;
-    let value = rest.trim_start().strip_prefix(':')?.trim();
-    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())).then_some(value)
+    let mut parser = JsonParser::new(body);
+    parser.whitespace();
+    parser.byte(b'{')?;
+    parser.whitespace();
+    if parser.string(name.len())? != name {
+        return None;
+    }
+    parser.whitespace();
+    parser.byte(b':')?;
+    parser.whitespace();
+    let start = parser.cursor;
+    while parser.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+        parser.cursor += 1;
+    }
+    if parser.cursor == start {
+        return None;
+    }
+    let value = &body[start..parser.cursor];
+    parser.whitespace();
+    parser.byte(b'}')?;
+    parser.whitespace();
+    parser.at_end().then_some(value)
+}
+
+struct JsonParser<'a> {
+    input: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.as_bytes(),
+            cursor: 0,
+        }
+    }
+    fn whitespace(&mut self) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.cursor += 1;
+        }
+    }
+    fn byte(&mut self, expected: u8) -> Option<()> {
+        (self.peek()? == expected).then(|| self.cursor += 1)
+    }
+    fn string(&mut self, max_bytes: usize) -> Option<&'a str> {
+        self.byte(b'"')?;
+        let start = self.cursor;
+        while let Some(byte) = self.peek() {
+            if byte == b'"' {
+                let value = std::str::from_utf8(&self.input[start..self.cursor]).ok()?;
+                self.cursor += 1;
+                return (value.len() <= max_bytes
+                    && !value.bytes().any(|byte| byte < 0x20 || byte == b'\\'))
+                .then_some(value);
+            }
+            if byte < 0x20 || byte == b'\\' {
+                return None;
+            }
+            self.cursor += 1;
+        }
+        None
+    }
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.cursor).copied()
+    }
+    fn at_end(&self) -> bool {
+        self.cursor == self.input.len()
+    }
 }
 
 fn json_escape(value: &str) -> String {
@@ -412,5 +516,83 @@ mod tests {
         assert_eq!(optional_depth(r#"{"depth":6}"#), Ok(Some(6)));
         assert!(optional_depth(r#"{"depth":7}"#).is_err());
         assert!(optional_depth(r#"{"depth":"3"}"#).is_err());
+        assert!(optional_depth(r#"{"depth":3} trailing"#).is_err());
+    }
+
+    #[test]
+    fn move_json_requires_one_complete_object_and_does_not_mutate_on_failure() {
+        for body in [
+            r#"{"move":"e2e4""#,
+            r#"{"move":"e2e4"} trailing"#,
+            r#"{"move":"e2e4","other":"value"}"#,
+            r#"{"move":"e2e4","move":"a2a3"}"#,
+            r#"{"move":"e2\\u00654"}"#,
+            r#"{"move":"e2e4"}}"#,
+        ] {
+            let mut session = GameSession::new(1);
+            let response = route(
+                &mut session,
+                &Request {
+                    method: "POST".into(),
+                    path: "/api/move".into(),
+                    body: body.into(),
+                },
+            );
+            assert_eq!(response.status, 400, "accepted malformed body: {body}");
+            assert!(session.moves.is_empty(), "mutated session for: {body}");
+        }
+        assert_eq!(
+            json_string_field(r#" { "move" : "E2E4" } "#, "move"),
+            Some("e2e4".into())
+        );
+    }
+
+    #[test]
+    fn oversized_header_line_is_rejected_before_a_body_is_allocated() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let session = Arc::new(Mutex::new(GameSession::new(1)));
+        let worker = thread::spawn(move || handle_connection(stream, session));
+        let prefix = b"GET /api/state HTTP/1.1 ";
+        client.write_all(prefix).unwrap();
+        client
+            .write_all(&vec![b'x'; MAX_HEADER_BYTES - prefix.len()])
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains("Request header is too large."));
+    }
+
+    #[test]
+    fn slow_client_does_not_block_another_connection() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let slow_client = TcpStream::connect(address).unwrap();
+        let (slow_stream, _) = listener.accept().unwrap();
+        let session = Arc::new(Mutex::new(GameSession::new(1)));
+        let slow_session = Arc::clone(&session);
+        thread::spawn(move || handle_connection(slow_stream, slow_session));
+
+        let mut fast_client = TcpStream::connect(address).unwrap();
+        let (fast_stream, _) = listener.accept().unwrap();
+        let fast_session = Arc::clone(&session);
+        let worker = thread::spawn(move || handle_connection(fast_stream, fast_session));
+        fast_client
+            .write_all(b"GET /api/state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        fast_client.read_to_string(&mut response).unwrap();
+        worker.join().unwrap();
+        drop(slow_client);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"fen\""));
     }
 }
