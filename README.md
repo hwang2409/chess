@@ -24,6 +24,5 @@ The executable supports the basic UCI handshake, `position startpos` / `position
 - This is a correctness-oriented v0, not a competitive engine. Sliding attacks use ray walking; the transposition table is fixed-size and scoped to each search; there are no magic bitboards, move-ordering heuristics beyond captures, or opening book.
 - UCI search is synchronous; `stop` cannot interrupt a search while `go` is running. Time checks occur throughout recursive search, but time allocation is intentionally rudimentary.
 - Search repetition tracking covers the current search path, not the complete game history supplied by the GUI. The UCI `position` command does not retain earlier game-position hashes for threefold claims.
-- Repetition identity currently includes the FEN en-passant file whenever present, even where no legal en-passant capture exists; strict FIDE repetition equivalence can therefore differ in edge cases.
 - FEN parsing checks field shape and en-passant rank but does not validate every chess-position invariant (for example, king counts, castling-right consistency, or reachability).
 - Search adjudicates repetition-path and 100-halfmove draws, plus conservative insufficient-material positions (bare kings, a single minor piece, and bishops confined to one square color). Claimable-draw protocol behavior and full game adjudication are not implemented.
