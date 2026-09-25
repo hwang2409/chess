@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +33,7 @@ fn main() {
     let mut position = Position::startpos();
     let mut history = vec![repetition_key(&position)];
     let mut active: Option<ActiveSearch> = None;
+    let mut deferred = VecDeque::new();
     let mut quitting = false;
 
     loop {
@@ -40,15 +42,19 @@ fn main() {
         {
             let search = active.take().unwrap();
             search.worker.join().unwrap();
-            write_search_result(&mut stdout, result);
-            stdout.flush().unwrap();
             if quitting {
                 break;
             }
+            write_search_result(&mut stdout, result);
+            stdout.flush().unwrap();
             continue;
         }
 
-        let command = if active.is_some() {
+        let command = if active.is_none() {
+            deferred
+                .pop_front()
+                .or_else(|| command_receiver.recv().ok())
+        } else {
             match command_receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(command) => Some(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -60,13 +66,13 @@ fn main() {
                     None
                 }
             }
-        } else {
-            match command_receiver.recv() {
-                Ok(command) => Some(command),
-                Err(_) => break,
-            }
         };
-        let Some(line) = command else { continue };
+        let Some(line) = command else {
+            if active.is_none() {
+                break;
+            }
+            continue;
+        };
 
         let mut words = line.split_whitespace();
         match words.next().unwrap_or("") {
@@ -118,7 +124,8 @@ fn main() {
                     break;
                 }
             }
-            "" | "ucinewgame" | "position" | "go" => {}
+            "ucinewgame" | "position" | "go" => deferred.push_back(line),
+            "" => {}
             _ => {}
         }
         stdout.flush().unwrap();

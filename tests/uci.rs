@@ -46,6 +46,28 @@ fn quit_and_wait(mut child: Child, mut stdin: ChildStdin) {
     assert!(child.wait().unwrap().success());
 }
 
+fn receive_through_bestmoves(
+    receiver: &Receiver<String>,
+    count: usize,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut output = String::new();
+    let mut received = 0;
+    while received < count {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = receiver
+            .recv_timeout(remaining)
+            .expect("timed out waiting for bestmove");
+        if line.starts_with("bestmove ") {
+            received += 1;
+        }
+        output.push_str(&line);
+        output.push('\n');
+    }
+    output
+}
+
 #[test]
 fn uci_handshake_and_search() {
     let (child, mut stdin, receiver) = start_engine();
@@ -101,6 +123,46 @@ fn uci_stop_interrupts_an_active_search_and_returns_one_bestmove() {
         "unexpected protocol output: {text}"
     );
     quit_and_wait(child, stdin);
+}
+
+#[test]
+fn uci_defers_position_and_go_following_stop_until_search_finishes() {
+    let (child, mut stdin, receiver) = start_engine();
+    stdin
+        .write_all(b"uci\nisready\nposition startpos\ngo depth 32\n")
+        .unwrap();
+    let handshake = receive_until(&receiver, Duration::from_secs(1), |line| line == "readyok");
+    assert!(handshake.contains("uciok"), "{handshake}");
+    thread::sleep(Duration::from_millis(20));
+
+    stdin
+        .write_all(b"stop\nposition startpos moves e2e4\ngo depth 1\n")
+        .unwrap();
+    let text = receive_through_bestmoves(&receiver, 2, Duration::from_secs(2));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("bestmove "))
+            .count(),
+        2,
+        "{text}"
+    );
+    assert!(text.contains("info depth 1"), "{text}");
+    assert!(text.contains("bestmove b8c6"), "{text}");
+    quit_and_wait(child, stdin);
+}
+
+#[test]
+fn uci_quit_during_search_reaps_without_search_response() {
+    let (mut child, mut stdin, receiver) = start_engine();
+    stdin
+        .write_all(b"position startpos\ngo depth 32\nquit\n")
+        .unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+        "quit emitted a final search response"
+    );
 }
 
 fn receive_until(
