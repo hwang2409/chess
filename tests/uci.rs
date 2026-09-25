@@ -40,10 +40,36 @@ fn receive_through_bestmove(receiver: &Receiver<String>, timeout: Duration) -> S
     }
 }
 
+fn wait_for_exit(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "engine exited unsuccessfully: {status}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "engine did not exit within {} ms",
+            timeout.as_millis()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn quit_and_wait(mut child: Child, mut stdin: ChildStdin) {
     stdin.write_all(b"quit\n").unwrap();
     drop(stdin);
-    assert!(child.wait().unwrap().success());
+    wait_for_exit(&mut child, Duration::from_secs(1));
+}
+
+fn synchronize_active_search(stdin: &mut ChildStdin, receiver: &Receiver<String>) -> String {
+    stdin.write_all(b"isready\n").unwrap();
+    let output = receive_until(receiver, Duration::from_secs(1), |line| line == "readyok");
+    assert!(
+        !output.lines().any(|line| line.starts_with("bestmove ")),
+        "search completed before synchronization: {output}"
+    );
+    output
 }
 
 fn receive_through_bestmoves(
@@ -91,14 +117,10 @@ fn uci_handshake_and_search() {
 fn uci_stop_interrupts_an_active_search_and_returns_one_bestmove() {
     let (child, mut stdin, receiver) = start_engine();
     stdin
-        .write_all(b"uci\nisready\nposition startpos\ngo depth 32\n")
+        .write_all(b"uci\nposition startpos\ngo depth 32\n")
         .unwrap();
-
-    // Waiting for the ordered handshake responses ensures the engine has begun
-    // consuming this command batch before requesting cancellation.
-    let handshake = receive_until(&receiver, Duration::from_secs(1), |line| line == "readyok");
+    let handshake = synchronize_active_search(&mut stdin, &receiver);
     assert!(handshake.contains("uciok"), "{handshake}");
-    thread::sleep(Duration::from_millis(20));
 
     let stopped_at = Instant::now();
     stdin.write_all(b"stop\n").unwrap();
@@ -129,11 +151,10 @@ fn uci_stop_interrupts_an_active_search_and_returns_one_bestmove() {
 fn uci_defers_position_and_go_following_stop_until_search_finishes() {
     let (child, mut stdin, receiver) = start_engine();
     stdin
-        .write_all(b"uci\nisready\nposition startpos\ngo depth 32\n")
+        .write_all(b"uci\nposition startpos\ngo depth 32\n")
         .unwrap();
-    let handshake = receive_until(&receiver, Duration::from_secs(1), |line| line == "readyok");
+    let handshake = synchronize_active_search(&mut stdin, &receiver);
     assert!(handshake.contains("uciok"), "{handshake}");
-    thread::sleep(Duration::from_millis(20));
 
     stdin
         .write_all(b"stop\nposition startpos moves e2e4\ngo depth 1\n")
@@ -152,13 +173,23 @@ fn uci_defers_position_and_go_following_stop_until_search_finishes() {
 }
 
 #[test]
-fn uci_quit_during_search_reaps_without_search_response() {
+fn uci_queued_quit_suppresses_a_completed_search_response() {
     let (mut child, mut stdin, receiver) = start_engine();
     stdin
-        .write_all(b"position startpos\ngo depth 32\nquit\n")
+        .write_all(b"position startpos\ngo depth 32\n")
         .unwrap();
+
+    // `readyok` is emitted by the command loop while the search worker is
+    // active. Seeing it before any search response synchronizes this test with
+    // an active search rather than relying on an unsynchronized `go`/`quit`
+    // input batch.
+    synchronize_active_search(&mut stdin, &receiver);
+
+    // `stop` makes the worker produce its final result, while queued `quit`
+    // must win over that result and suppress all search output.
+    stdin.write_all(b"stop\nquit\n").unwrap();
     drop(stdin);
-    assert!(child.wait().unwrap().success());
+    wait_for_exit(&mut child, Duration::from_secs(1));
     assert!(
         receiver.recv_timeout(Duration::from_millis(100)).is_err(),
         "quit emitted a final search response"
