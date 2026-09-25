@@ -17,13 +17,12 @@ The executable supports the basic UCI handshake, `position startpos` / `position
 - Pseudo-legal and legal move generation, including castling, en passant, and promotions.
 - Reversible make/unmake state for board and rule counters.
 - Perft and divide, checked against start-position depths 1–4 and Kiwipete depths 1–3.
-- Iterative-deepening negamax with alpha-beta, capture/promotion quiescence, basic material/positional evaluation, repetition/50-move draw checks, and time limits.
+- Iterative-deepening negamax with alpha-beta, a scoped transposition table, capture/promotion quiescence, basic material/positional evaluation, repetition/50-move draw checks, and time limits.
 
 ## Known limitations
 
-- This is a correctness-oriented v0, not a competitive engine. Sliding attacks use ray walking; there are no magic bitboards, transposition table, move-ordering heuristics beyond captures, or opening book.
+- This is a correctness-oriented v0, not a competitive engine. Sliding attacks use ray walking; the transposition table is fixed-size and scoped to each search; there are no magic bitboards, move-ordering heuristics beyond captures, or opening book.
 - UCI searches run on a worker thread so `stop` can cancel the active search. Time checks and cancellation checks occur throughout recursive search, but time allocation is intentionally rudimentary.
 - Search repetition tracking covers the current search path, not the complete game history supplied by the GUI. The UCI `position` command does not retain earlier game-position hashes for threefold claims.
-- Repetition identity currently includes the FEN en-passant file whenever present, even where no legal en-passant capture exists; strict FIDE repetition equivalence can therefore differ in edge cases.
 - FEN parsing checks field shape and en-passant rank but does not validate every chess-position invariant (for example, king counts, castling-right consistency, or reachability).
-- Draw adjudication is limited to repetition-path and 100-halfmove checks. Insufficient material, claimable-draw protocol behavior, and full game adjudication are not implemented.
+- Search adjudicates repetition-path and 100-halfmove draws, plus conservative insufficient-material positions (bare kings, a single minor piece, and bishops confined to one square color). Claimable-draw protocol behavior and full game adjudication are not implemented.

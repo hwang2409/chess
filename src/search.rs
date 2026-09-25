@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 const INF: i32 = 32_000;
 const MATE: i32 = 30_000;
 const MAX_PLY: usize = 64;
+const TT_SIZE: usize = 1 << 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchResult {
@@ -18,12 +19,65 @@ pub struct SearchResult {
     pub nodes: u64,
 }
 
+#[derive(Clone, Copy)]
+enum Bound {
+    Exact,
+    Lower,
+    Upper,
+}
+
+#[derive(Clone, Copy)]
+struct TranspositionEntry {
+    key: u64,
+    history_key: u64,
+    depth: u8,
+    score: i32,
+    bound: Bound,
+    best_move: Option<Move>,
+}
+
+/// A fixed-size, direct-mapped table retained only for one iterative search.
+///
+/// Entries also carry a compact key for the current repetition path, so a
+/// bound is not reused with different draw history. Keeping the table scoped
+/// this way avoids carrying bounds across unrelated game histories while still
+/// allowing each deeper iteration to reuse completed work.
+struct TranspositionTable {
+    entries: Vec<Option<TranspositionEntry>>,
+}
+
+impl TranspositionTable {
+    fn new() -> Self {
+        Self {
+            entries: vec![None; TT_SIZE],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
+    fn get(&self, key: u64, history_key: u64) -> Option<TranspositionEntry> {
+        self.entries[key as usize & (TT_SIZE - 1)]
+            .filter(|entry| entry.key == key && entry.history_key == history_key)
+    }
+
+    fn store(&mut self, entry: TranspositionEntry) {
+        let slot = &mut self.entries[entry.key as usize & (TT_SIZE - 1)];
+        if slot.is_none_or(|old| entry.depth >= old.depth) {
+            *slot = Some(entry);
+        }
+    }
+}
+
 pub struct Searcher {
     nodes: u64,
     deadline: Option<Instant>,
     cancelled: Option<Arc<AtomicBool>>,
     aborted: bool,
     path: Vec<u64>,
+    tt: TranspositionTable,
+    tt_enabled: bool,
 }
 
 impl Searcher {
@@ -34,9 +88,22 @@ impl Searcher {
             cancelled: None,
             aborted: false,
             path: Vec::new(),
+            tt: TranspositionTable::new(),
+            tt_enabled: true,
         }
     }
-    pub fn clear(&mut self) {}
+
+    #[cfg(test)]
+    fn without_transposition_table() -> Self {
+        Self {
+            tt_enabled: false,
+            ..Self::new()
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.tt.clear();
+    }
 
     pub fn search(
         &mut self,
@@ -75,6 +142,7 @@ impl Searcher {
         self.aborted = false;
         self.deadline = limit.and_then(|d| Instant::now().checked_add(d));
         self.cancelled = cancelled;
+        self.tt.clear();
         self.path.clear();
         let reversible_history_len = usize::from(position.halfmove_clock());
         self.path
@@ -96,7 +164,10 @@ impl Searcher {
             };
             return result;
         }
-        if self.is_repetition() || position.halfmove_clock() >= 100 {
+        if position.is_insufficient_material()
+            || self.is_repetition()
+            || position.halfmove_clock() >= 100
+        {
             result.best_move = None;
             result.score = 0;
             return result;
@@ -136,7 +207,7 @@ impl Searcher {
         p: &mut Position,
         depth: u8,
         mut alpha: i32,
-        beta: i32,
+        mut beta: i32,
         ply: usize,
     ) -> i32 {
         self.nodes += 1;
@@ -148,14 +219,43 @@ impl Searcher {
         }
         // Checkmate and stalemate take precedence over draw claims at this node.
         let check = in_check(p, p.side_to_move());
-        let moves = legal_moves(p);
+        let mut moves = legal_moves(p);
         if moves.is_empty() {
             return if check { -MATE + ply as i32 } else { 0 };
         }
-        if self.is_repetition() || p.halfmove_clock() >= 100 {
+        if p.is_insufficient_material() || self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
+
+        let key = p.zobrist_hash();
+        let history_key = self.repetition_path_key();
+        let tt_entry = self
+            .tt_enabled
+            .then(|| self.tt.get(key, history_key))
+            .flatten();
+        if let Some(entry) = tt_entry {
+            if entry.depth >= depth {
+                let score = score_from_tt(entry.score, ply);
+                match entry.bound {
+                    Bound::Exact => return score,
+                    Bound::Lower => alpha = alpha.max(score),
+                    Bound::Upper => beta = beta.min(score),
+                }
+                if alpha >= beta {
+                    return score;
+                }
+            }
+            if let Some(best_move) = entry.best_move
+                && let Some(index) = moves.iter().position(|mv| *mv == best_move)
+            {
+                moves.swap(0, index);
+            }
+        }
+
+        let alpha_bound = alpha;
+        let beta_bound = beta;
         let mut best = -INF;
+        let mut best_move = None;
         for mv in moves {
             let undo = p.make_move(mv);
             self.path.push(repetition_key(p));
@@ -165,11 +265,32 @@ impl Searcher {
             if self.aborted {
                 return 0;
             }
-            best = best.max(score);
+            if score > best {
+                best = score;
+                best_move = Some(mv);
+            }
             alpha = alpha.max(score);
             if alpha >= beta {
                 break;
             }
+        }
+
+        if self.tt_enabled {
+            let bound = if best <= alpha_bound {
+                Bound::Upper
+            } else if best >= beta_bound {
+                Bound::Lower
+            } else {
+                Bound::Exact
+            };
+            self.tt.store(TranspositionEntry {
+                key,
+                history_key,
+                depth,
+                score: score_to_tt(best, ply),
+                bound,
+                best_move,
+            });
         }
         best
     }
@@ -192,7 +313,7 @@ impl Searcher {
             }
             None
         };
-        if self.is_repetition() || p.halfmove_clock() >= 100 {
+        if p.is_insufficient_material() || self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
         let stand = evaluate(p);
@@ -224,6 +345,12 @@ impl Searcher {
             alpha = alpha.max(score);
         }
         alpha
+    }
+
+    fn repetition_path_key(&self) -> u64 {
+        self.path.iter().fold(0, |key, position_key| {
+            key.wrapping_add(mix_history_key(*position_key))
+        })
     }
 
     fn is_repetition(&self) -> bool {
@@ -258,6 +385,34 @@ impl Searcher {
 impl Default for Searcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn mix_history_key(mut key: u64) -> u64 {
+    key ^= key >> 30;
+    key = key.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    key ^= key >> 27;
+    key = key.wrapping_mul(0x94d0_49bb_1331_11eb);
+    key ^ (key >> 31)
+}
+
+fn score_to_tt(score: i32, ply: usize) -> i32 {
+    if score >= MATE - MAX_PLY as i32 {
+        score + ply as i32
+    } else if score <= -MATE + MAX_PLY as i32 {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+fn score_from_tt(score: i32, ply: usize) -> i32 {
+    if score >= MATE - MAX_PLY as i32 {
+        score - ply as i32
+    } else if score <= -MATE + MAX_PLY as i32 {
+        score + ply as i32
+    } else {
+        score
     }
 }
 
@@ -305,7 +460,7 @@ fn evaluate(p: &Position) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Searcher;
+    use super::{MATE, Searcher, score_from_tt, score_to_tt};
     use crate::movegen::legal_moves;
     use crate::{Position, hash};
     use std::time::Duration;
@@ -367,6 +522,34 @@ mod tests {
     }
 
     #[test]
+    fn repetition_history_ignores_an_unavailable_en_passant_target() {
+        let mut with_target = Position::from_fen("4k3/8/8/3p4/8/8/8/4K3 w - d6 2 1").unwrap();
+        let without_target = Position::from_fen("4k3/8/8/3p4/8/8/8/4K3 w - - 2 1").unwrap();
+        let key = hash::repetition_key(&without_target);
+
+        // The two preceding equivalent positions plus the current position
+        // are a threefold repetition even though this FEN carries d6.
+        let result = Searcher::new().search_with_history(&mut with_target, 2, None, &[key, key]);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+    }
+
+    #[test]
+    fn insufficient_material_is_a_root_and_interior_search_draw() {
+        let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let result = Searcher::new().search(&mut p, 3, None);
+        assert_eq!(result.depth, 0);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
+
+        let mut p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let mut searcher = Searcher::new();
+        assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 1), 0);
+        assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 1), 0);
+    }
+
+    #[test]
     fn root_halfmove_clock_draw_returns_no_move() {
         let mut p =
             Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 100 51")
@@ -393,6 +576,8 @@ mod tests {
     }
 
     #[test]
+    // Exercises both negamax and qsearch terminal-first behavior: mate remains a mate,
+    // and stalemate remains a draw, even when repetition and the 100-halfmove rule apply.
     fn interior_terminal_positions_precede_repetition_and_halfmove_draws() {
         for (fen, expected) in [
             ("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1", -29_996),
@@ -424,10 +609,63 @@ mod tests {
     }
 
     #[test]
+    fn insufficient_material_stalemate_is_recognized_as_terminal_at_root_and_qsearch() {
+        // Black is stalemated; the lone bishop also qualifies as insufficient material.
+        let mut p = Position::from_fen("7k/5B2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert!(p.is_insufficient_material());
+        assert!(legal_moves(&mut p).is_empty());
+        let root = Searcher::new().search(&mut p, 2, None);
+        assert_eq!(root.score, 0);
+        assert_eq!(root.best_move, None);
+
+        let mut searcher = Searcher::new();
+        assert_eq!(searcher.negamax(&mut p, 2, -32_000, 32_000, 1), 0);
+        assert_eq!(searcher.quiescence(&mut p, -32_000, 32_000, 1), 0);
+    }
+
+    #[test]
     fn quiescence_returns_draw_for_noncheck_stalemate() {
         // Black to move is stalemated in this position.
         let mut p = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
         assert_eq!(Searcher::new().quiescence(&mut p, -32_000, 32_000, 1), 0);
+    }
+
+    #[test]
+    fn transposition_table_mate_scores_are_ply_normalized() {
+        assert_eq!(score_from_tt(score_to_tt(MATE - 9, 7), 7), MATE - 9);
+        assert_eq!(score_from_tt(score_to_tt(-MATE + 9, 7), 7), -MATE + 9);
+        assert_eq!(score_from_tt(score_to_tt(MATE - 9, 7), 3), MATE - 5);
+        assert_eq!(score_from_tt(score_to_tt(-MATE + 9, 7), 3), -MATE + 5);
+    }
+
+    #[test]
+    fn transposition_table_normalizes_mate_window_boundaries() {
+        let positive_boundary = MATE - super::MAX_PLY as i32;
+        let negative_boundary = -MATE + super::MAX_PLY as i32;
+
+        assert_eq!(
+            score_from_tt(score_to_tt(positive_boundary, 7), 3),
+            positive_boundary + 4
+        );
+        assert_eq!(
+            score_from_tt(score_to_tt(negative_boundary, 7), 3),
+            negative_boundary - 4
+        );
+    }
+
+    #[test]
+    fn transposition_table_preserves_result_and_reduces_nodes() {
+        let mut with_tt_position = Position::startpos();
+        let with_tt = Searcher::new().search(&mut with_tt_position, 4, None);
+        let mut without_tt_position = Position::startpos();
+        let without_tt =
+            Searcher::without_transposition_table().search(&mut without_tt_position, 4, None);
+
+        assert_eq!(with_tt.depth, without_tt.depth);
+        assert_eq!(with_tt.score, without_tt.score);
+        assert_eq!(with_tt.best_move, without_tt.best_move);
+        assert_eq!(with_tt_position, without_tt_position);
+        assert!(with_tt.nodes < without_tt.nodes);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::{Color, PieceKind, Position};
+use crate::{Color, PieceKind, Position, Square, attacks};
 use std::sync::OnceLock;
 
 struct Keys {
@@ -43,7 +43,8 @@ fn keys() -> &'static Keys {
     })
 }
 
-/// Position identity for repetition: board, side, castling, and en-passant state.
+/// Position identity for repetition: board, side, castling, and an en-passant
+/// file only when the side to move can legally capture en passant.
 pub fn repetition_key(p: &Position) -> u64 {
     board_key(p)
 }
@@ -76,8 +77,114 @@ fn board_key(p: &Position) -> u64 {
     if p.side_to_move() == Color::Black {
         hash ^= k.side;
     }
-    if let Some(ep) = p.en_passant_square() {
+    if let Some(ep) = legal_en_passant_square(p) {
         hash ^= k.ep_file[ep.file() as usize];
     }
     hash
+}
+
+/// Returns the en-passant target only when at least one capture is legal.
+///
+/// This intentionally models the capture on temporary bitboards instead of
+/// calling move generation or mutating `Position`: hashing remains independent
+/// of move generation and cannot disturb make/unmake state.
+fn legal_en_passant_square(p: &Position) -> Option<Square> {
+    let target = p.en_passant_square()?;
+    let us = p.side_to_move();
+    let them = us.opposite();
+    if p.piece_at(target).is_some() {
+        return None;
+    }
+    let captured = target.offset(0, if us == Color::White { -1 } else { 1 })?;
+    if p.piece_at(captured)
+        != Some(crate::Piece {
+            color: them,
+            kind: PieceKind::Pawn,
+        })
+    {
+        return None;
+    }
+
+    let candidates = attacks::pawn(target, them) & p.pieces(us, PieceKind::Pawn);
+    let king = p.king_square(us)?;
+    let occupied = p.occupied();
+    let enemy_pawns = p.pieces(them, PieceKind::Pawn) & !captured.bit();
+    let mut remaining = candidates;
+    while remaining != 0 {
+        let from = Square::new(remaining.trailing_zeros() as u8).unwrap();
+        remaining &= remaining - 1;
+        let after = (occupied & !from.bit() & !captured.bit()) | target.bit();
+        if !is_square_attacked(p, king, them, enemy_pawns, after) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// Attack probe for an en-passant capture represented by `occupied` and the
+/// enemy pawn set after its captured pawn has been removed.
+fn is_square_attacked(p: &Position, square: Square, by: Color, pawns: u64, occupied: u64) -> bool {
+    attacks::pawn(square, by.opposite()) & pawns != 0
+        || attacks::knight(square) & p.pieces(by, PieceKind::Knight) != 0
+        || attacks::king(square) & p.pieces(by, PieceKind::King) != 0
+        || attacks::bishop(square, occupied)
+            & (p.pieces(by, PieceKind::Bishop) | p.pieces(by, PieceKind::Queen))
+            != 0
+        || attacks::rook(square, occupied)
+            & (p.pieces(by, PieceKind::Rook) | p.pieces(by, PieceKind::Queen))
+            != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repetition_key;
+    use crate::Position;
+    use crate::movegen::legal_moves;
+
+    fn position(fen: &str) -> Position {
+        Position::from_fen(fen).unwrap()
+    }
+
+    #[test]
+    fn repetition_ignores_en_passant_without_an_adjacent_pawn() {
+        let with_target = position("4k3/8/8/3p4/8/8/8/4K3 w - d6 0 1");
+        let without_target = position("4k3/8/8/3p4/8/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            repetition_key(&with_target),
+            repetition_key(&without_target)
+        );
+    }
+
+    #[test]
+    fn repetition_ignores_pseudo_legal_but_pinned_en_passant() {
+        // c4xd3 would expose the rook on a4 to Black's king on g4.
+        let with_target = position("8/6bb/8/8/R1pP2k1/4P3/P7/K7 b - d3 0 1");
+        let without_target = position("8/6bb/8/8/R1pP2k1/4P3/P7/K7 b - - 0 1");
+        let mut moves = with_target.clone();
+        assert!(
+            !legal_moves(&mut moves)
+                .iter()
+                .any(|mv| mv.to_string() == "c4d3")
+        );
+        assert_eq!(
+            repetition_key(&with_target),
+            repetition_key(&without_target)
+        );
+    }
+
+    #[test]
+    fn repetition_includes_a_legal_en_passant_file() {
+        let with_target = position("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1");
+        let without_target = position("4k3/8/8/3pP3/8/8/8/4K3 w - - 0 1");
+        let mut moves = with_target.clone();
+        assert!(
+            legal_moves(&mut moves)
+                .iter()
+                .any(|mv| mv.to_string() == "e5d6")
+        );
+        assert_ne!(
+            repetition_key(&with_target),
+            repetition_key(&without_target)
+        );
+    }
 }
