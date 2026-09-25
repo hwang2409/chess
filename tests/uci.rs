@@ -186,13 +186,15 @@ fn uci_queued_quit_suppresses_a_completed_search_response() {
     synchronize_active_search(&mut stdin, &receiver);
 
     // `stop` makes the worker produce its final result, while queued `quit`
-    // must win over that result and suppress all search output.
-    stdin.write_all(b"stop\nquit\n").unwrap();
+    // must win over that result and suppress all search output. `isready` is
+    // deliberately queued after quit: it must never be dispatched while the
+    // cancelled worker is being reaped.
+    stdin.write_all(b"stop\nquit\nisready\n").unwrap();
     drop(stdin);
     wait_for_exit(&mut child, Duration::from_secs(1));
     assert!(
         receiver.recv_timeout(Duration::from_millis(100)).is_err(),
-        "quit emitted a final search response"
+        "quit emitted protocol output after acceptance"
     );
 }
 

@@ -62,6 +62,16 @@ fn main() {
     let mut quitting = false;
 
     loop {
+        // `quit` cancels an active search. Do not dispatch queued commands
+        // while waiting for that worker to finish; they must not emit output
+        // after quit has been accepted.
+        if quitting {
+            if let Some(search) = active.take() {
+                search.worker.join().unwrap();
+            }
+            break;
+        }
+
         let command = if let Some(search) = active.as_ref() {
             match poll_active_event(&command_receiver, search) {
                 ActiveEvent::Command(command) => Some(command),
