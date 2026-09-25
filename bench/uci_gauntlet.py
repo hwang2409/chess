@@ -358,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-plies", type=int, default=300); parser.add_argument("--startup-timeout-ms", type=int, default=5000); parser.add_argument("--response-timeout-ms", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
     args=parser.parse_args(argv)
-    if args.movetime_ms is not None and args.movetime_ms < 1 or args.depth is not None and args.depth < 1 or args.max_plies < 1: parser.error("controls and max plies must be positive")
+    if args.pairs < 1 or args.movetime_ms is not None and args.movetime_ms < 1 or args.depth is not None and args.depth < 1 or args.max_plies < 1: parser.error("pairs, controls, and max plies must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()): parser.error("output directory must be empty or absent")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     openings=load_openings(args.openings,args.opening_limit); games=color_paired_games(openings,args.pairs)

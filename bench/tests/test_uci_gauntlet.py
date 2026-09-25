@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -106,6 +108,22 @@ class UciGauntletTests(unittest.TestCase):
             with self.assertRaisesRegex(ProtocolError, "stdout queue overflow"):
                 UciEngine("fake", command, 1)
             self._assert_process_reaped(_wait_for_pid(pid_file))
+
+    def test_nonpositive_pairs_is_an_argparse_error_before_output_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for pairs in ("0", "-1"):
+                with self.subTest(pairs=pairs):
+                    output = Path(directory) / f"output-{pairs}"
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+                        main([
+                            "--rookery", "rookery", "--opponent", "opponent", "--depth", "1",
+                            "--pairs", pairs, "--output-dir", str(output),
+                        ])
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertIn("error: pairs, controls, and max plies must be positive", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    self.assertFalse(output.exists())
 
     def test_mid_game_protocol_failure_is_not_counted_as_completed(self):
         fixture = {"openings": [{"id": "one", "fen": "4k3/8/8/8/8/8/8/4K3 w - - 0 1"}]}
