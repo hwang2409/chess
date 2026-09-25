@@ -1,28 +1,31 @@
 # Rookery
 
-Rookery is a from-scratch Rust chess engine in an early v0 state. The core is dependency-light and uses bitboards with portable ray-walking sliding attacks.
+Rookery is a small, from-scratch Rust chess engine at the v1 release-readiness stage. It uses bitboards and portable ray-walking sliding attacks, with no third-party crate dependencies. It is intended as a correctness-oriented UCI engine rather than a competitive one.
 
 ## Build and run
 
 ```sh
-cargo test
+cargo test --all-targets
 cargo run --release
 ```
 
-The executable supports the basic UCI handshake, `position startpos` / `position fen ...` with move lists, `go depth N`, basic time controls (`movetime`, `wtime`/`btime` and increments), `stop`, and `go perft N` (with root divide output).
+The executable supports the UCI handshake, `isready`, `ucinewgame`, `position startpos` and `position fen ...` with move lists, `go depth N`, `go movetime N`, basic `wtime`/`btime` plus increments, `stop`, `quit`, and `go perft N` (root divide output followed by a total). Searches run on a worker thread; `stop` requests cancellation and the command loop emits one final `bestmove` after the worker completes.
 
-## Implemented
+## Implemented in v1
 
-- Board primitives, attack generation, FEN parse/serialize, and UCI move parsing.
-- Pseudo-legal and legal move generation, including castling, en passant, and promotions.
-- Reversible make/unmake state for board and rule counters.
-- Perft and divide, checked against start-position depths 1–4 and Kiwipete depths 1–3.
-- Iterative-deepening negamax with alpha-beta, a scoped transposition table, capture/promotion quiescence, basic material/positional evaluation, repetition/50-move draw checks, and time limits.
+- Board primitives, UCI coordinate-move parsing/formatting, and structural FEN parsing and serialization.
+- Legal move generation, including castling, en passant, promotions, check, checkmate, and stalemate handling.
+- Reversible make/unmake state, including rule counters, castling rights, and en-passant state.
+- Perft and root divide coverage for start position, Kiwipete, standard regression fixtures, pinned moves, en-passant discovered checks, and castling transit/rights cases.
+- Iterative-deepening negamax with alpha-beta, capture/promotion quiescence, material/positional evaluation, basic capture ordering, and a fixed-size direct-mapped transposition table scoped to one search.
+- Search draw handling for threefold repetition from the supplied UCI game history and current search path, the 100-halfmove threshold, and conservative insufficient-material positions.
+- Repetition identity that includes an en-passant target only when the side to move has a legal en-passant capture.
+- UCI search cancellation through `stop`, including ordered handling of commands queued while a search is being cancelled.
 
 ## Known limitations
 
-- This is a correctness-oriented v0, not a competitive engine. Sliding attacks use ray walking; the transposition table is fixed-size and scoped to each search; there are no magic bitboards, move-ordering heuristics beyond captures, or opening book.
-- UCI searches run on a worker thread so `stop` can cancel the active search. Time checks and cancellation checks occur throughout recursive search, but time allocation is intentionally rudimentary.
-- Search repetition tracking covers the current search path, not the complete game history supplied by the GUI. The UCI `position` command does not retain earlier game-position hashes for threefold claims.
-- FEN parsing checks field shape and en-passant rank but does not validate every chess-position invariant (for example, king counts, castling-right consistency, or reachability).
-- Search adjudicates repetition-path and 100-halfmove draws, plus conservative insufficient-material positions (bare kings, a single minor piece, and bishops confined to one square color). Claimable-draw protocol behavior and full game adjudication are not implemented.
+- Rookery is a simple v1 engine, not a competitive engine. Sliding attacks use ray walking; move ordering is limited; the transposition table is fixed-size/direct-mapped and discarded for each search. There is no opening book, pondering, tablebase support, or advanced search heuristics.
+- Time allocation is deliberately basic. The supported `go` options are limited to depth, movetime, and side-to-move clock/increment inputs; unsupported UCI options are ignored.
+- FEN parsing validates field structure, piece placement syntax, canonical castling-field spelling, counters, and en-passant rank, but does not validate all chess-position invariants, castling-piece consistency, or reachability.
+- Draw adjudication is engine behavior rather than full claimable-draw protocol support. Insufficient-material recognition is intentionally conservative (bare kings, a single minor, or bishops all on one square color); broader dead-position analysis is not implemented.
+- The engine tracks repetition history supplied through the current UCI `position` command and the search path. It has no persistent game database or recovery of history omitted by a GUI.

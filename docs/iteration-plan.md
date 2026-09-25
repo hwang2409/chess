@@ -1,25 +1,26 @@
-# Rookery v0 correctness iteration
+# Rookery v1 iteration plan and status
 
-Each feature is developed in its own Git worktree/branch, reviewed independently, and merged only after review findings are resolved.
+Rookery's v1 correctness-oriented scope is implemented. Work was developed in isolated branches, reviewed, and integrated before this release-readiness pass. The remaining work is post-v1 enhancement, not a promised v1 feature set.
 
-## Feature 1: Perft regression suite (`feature/perft-regressions`)
+## Completed v1 work
 
-Contract: add integration tests only; do not change engine behavior. Cover at least two established standard perft positions beyond existing start-position/Kiwipete coverage, use trustworthy FEN/count fixtures through conservative depths, and assert `Position` is unchanged after each count.
+| Area | Delivered scope |
+| --- | --- |
+| Core position and moves | Bitboard board representation, FEN serialization/parsing, legal move generation, and reversible make/unmake, including castling, en passant, and promotion. |
+| FEN validation | Structural six-field validation; board-rank and piece syntax checks; active-color, canonical castling-field, en-passant-rank, and counter validation. Parser deliberately does not prove arbitrary positions legal or reachable. |
+| Perft and mutation safety | Start-position and Kiwipete checks plus standard positions and targeted pin, en-passant-discovered-check, and castling edge cases. Deterministic move-sequence tests verify complete make/unmake restoration. |
+| Draw handling | Search detects checkmate/stalemate before draw adjudication, then handles threefold repetition from game/search history, the 100-halfmove threshold, and conservative insufficient-material cases. |
+| Repetition identity | Repetition keys distinguish an en-passant target only when at least one legal en-passant capture exists; probing does not mutate the position. |
+| Search | Iterative deepening, alpha-beta, quiescence, basic evaluation/capture ordering, time limits, and a per-search fixed-size direct-mapped transposition table whose entries are keyed by position and repetition path. |
+| UCI | Handshake, readiness, positions with move lists, depth/time searches, perft/divide, and worker-thread search cancellation via `stop`. Queued position/go commands wait for the stopped search; queued quit suppresses its response. |
 
-Acceptance: `cargo fmt --check` and `cargo test` pass; an independent review confirms fixture accuracy and useful coverage.
+## Release-readiness verification
 
-## Feature 2: Make/unmake sequence coverage (`feature/make-unmake-tests`)
+The release-readiness branch runs the dependency-free crate's formatting, lint, debug all-target test, release all-target test, and deterministic release-binary UCI smoke checks. The test suite covers library behavior and subprocess UCI behavior; it is not a proof of full rules, protocol, or playing-strength coverage.
 
-Contract: add deterministic integration tests only. Walk legal move sequences from start position and special-rule positions, retain every `Undo`, unwind, and compare the complete `Position` with its initial value. Exercise promotion, en passant, and castling where practical; no external dependencies.
+## Deferred after v1
 
-Acceptance: `cargo fmt --check` and `cargo test` pass; review confirms deterministic legal paths and complete restoration assertions.
-
-## Feature 3: Game-history threefold repetition (`feature/repetition-history`)
-
-Contract: add a backward-compatible search entry point accepting repetition-key history; detect a draw only on the third occurrence (including current position); preserve root/search history semantics; have UCI position parsing reset history for a new position and append position keys after each move, then pass history to search. Do not broaden scope to insufficient material or en-passant-key semantics.
-
-Acceptance: tests distinguish one prior occurrence from two prior occurrences at root and verify UCI game history reaches search; `cargo fmt --check`, tests, and clippy pass; independent review is clean before merge.
-
-## Integration policy
-
-Branches are isolated worktrees rooted at the published `main` baseline. Review each branch before integration, address findings on that branch, then merge in sequence and run the full verification suite on `main`. Public repository: https://github.com/hwang2409/rookery-chess
+- Competitive-engine work: faster sliding attacks, stronger move ordering and pruning, opening books, pondering, tablebases, and persistent/trans-search TT management.
+- Broader UCI support and more sophisticated clock management.
+- Full game-adjudication and claimable-draw protocol behavior, broader dead-position analysis, and validation of all FEN position invariants/reachability.
+- Additional long-running randomized, differential, and platform-specific testing beyond the bounded regression suite.
