@@ -369,9 +369,9 @@ fn mix_history_key(mut key: u64) -> u64 {
 }
 
 fn score_to_tt(score: i32, ply: usize) -> i32 {
-    if score > MATE - MAX_PLY as i32 {
+    if score >= MATE - MAX_PLY as i32 {
         score + ply as i32
-    } else if score < -MATE + MAX_PLY as i32 {
+    } else if score <= -MATE + MAX_PLY as i32 {
         score - ply as i32
     } else {
         score
@@ -379,9 +379,9 @@ fn score_to_tt(score: i32, ply: usize) -> i32 {
 }
 
 fn score_from_tt(score: i32, ply: usize) -> i32 {
-    if score > MATE - MAX_PLY as i32 {
+    if score >= MATE - MAX_PLY as i32 {
         score - ply as i32
-    } else if score < -MATE + MAX_PLY as i32 {
+    } else if score <= -MATE + MAX_PLY as i32 {
         score + ply as i32
     } else {
         score
@@ -563,6 +563,21 @@ mod tests {
         assert_eq!(score_from_tt(score_to_tt(-MATE + 9, 7), 7), -MATE + 9);
         assert_eq!(score_from_tt(score_to_tt(MATE - 9, 7), 3), MATE - 5);
         assert_eq!(score_from_tt(score_to_tt(-MATE + 9, 7), 3), -MATE + 5);
+    }
+
+    #[test]
+    fn transposition_table_normalizes_mate_window_boundaries() {
+        let positive_boundary = MATE - super::MAX_PLY as i32;
+        let negative_boundary = -MATE + super::MAX_PLY as i32;
+
+        assert_eq!(
+            score_from_tt(score_to_tt(positive_boundary, 7), 3),
+            positive_boundary + 4
+        );
+        assert_eq!(
+            score_from_tt(score_to_tt(negative_boundary, 7), 3),
+            negative_boundary - 4
+        );
     }
 
     #[test]
