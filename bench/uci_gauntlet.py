@@ -80,37 +80,53 @@ def load_openings(path: Path, limit: int | None) -> list[Opening]:
 class UciEngine:
     def __init__(self, label: str, command: str, timeout: float):
         self.label, self.timeout = label, timeout
-        try:
-            self.process = subprocess.Popen(shlex.split(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        except (OSError, ValueError) as error: raise GauntletError(f"cannot start {label}: {error}") from error
-        if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None: raise GauntletError(f"cannot pipe {label}")
+        self.process: subprocess.Popen[str] | None = None
         self.lines: queue.Queue[str | None] = queue.Queue(maxsize=512)
         self.stderr: list[str] = []
         self.reader_error: str | None = None
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-        self.send("uci"); self.wait_for(lambda line: line == "uciok", "uciok")
-        self.send("isready"); self.wait_for(lambda line: line == "readyok", "readyok")
+        self.stdout_closed = False
+        try:
+            self.process = subprocess.Popen(shlex.split(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except (OSError, ValueError) as error:
+            raise GauntletError(f"cannot start {label}: {error}") from error
+        try:
+            if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
+                raise GauntletError(f"cannot pipe {label}")
+            threading.Thread(target=self._read_stdout, daemon=True).start()
+            threading.Thread(target=self._read_stderr, daemon=True).start()
+            self.send("uci"); self.wait_for(lambda line: line == "uciok", "uciok")
+            self.send("isready"); self.wait_for(lambda line: line == "readyok", "readyok")
+        except BaseException:
+            self.close()
+            raise
 
     def _read_stdout(self) -> None:
-        assert self.process.stdout
+        assert self.process and self.process.stdout
         try:
             for raw in self.process.stdout:
                 line = raw.rstrip("\r\n")
-                try: self.lines.put(line, timeout=0.1)
-                except queue.Full: self.reader_error = "stdout queue overflow"; return
+                if self.reader_error is not None:
+                    continue
+                try:
+                    self.lines.put_nowait(line)
+                except queue.Full:
+                    # Keep draining the pipe after recording the protocol error so a
+                    # noisy child cannot remain blocked while close() reaps it.
+                    self.reader_error = "stdout queue overflow"
         finally:
+            self.stdout_closed = True
             try: self.lines.put_nowait(None)
             except queue.Full: pass
 
     def _read_stderr(self) -> None:
-        assert self.process.stderr
+        assert self.process and self.process.stderr
         for raw in self.process.stderr:
             self.stderr.append(raw.rstrip())
             if len(self.stderr) > 40: self.stderr.pop(0)
 
     def send(self, command: str) -> None:
         if self.reader_error: raise ProtocolError(f"{self.label}: {self.reader_error}")
+        assert self.process
         if self.process.poll() is not None: raise GauntletError(f"{self.label} exited with {self.process.returncode}; stderr: {' | '.join(self.stderr)}")
         try:
             assert self.process.stdin; self.process.stdin.write(command + "\n"); self.process.stdin.flush()
@@ -119,11 +135,16 @@ class UciEngine:
     def wait_for(self, predicate, expected: str, timeout: float | None = None) -> str:
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while True:
+            if self.reader_error: raise ProtocolError(f"{self.label}: {self.reader_error}")
             remaining = deadline - time.monotonic()
             if remaining <= 0: raise EngineTimeout(f"{self.label}: timed out waiting for {expected}")
             try: line = self.lines.get(timeout=remaining)
-            except queue.Empty: raise EngineTimeout(f"{self.label}: timed out waiting for {expected}")
-            if line is None: raise GauntletError(f"{self.label} closed stdout; stderr: {' | '.join(self.stderr)}")
+            except queue.Empty:
+                if self.reader_error: raise ProtocolError(f"{self.label}: {self.reader_error}")
+                if self.stdout_closed: raise ProtocolError(f"{self.label} closed stdout; stderr: {' | '.join(self.stderr)}")
+                raise EngineTimeout(f"{self.label}: timed out waiting for {expected}")
+            if line is None or self.stdout_closed and self.lines.empty():
+                raise ProtocolError(f"{self.label} closed stdout; stderr: {' | '.join(self.stderr)}")
             if predicate(line): return line
 
     def bestmove(self, fen: str, moves: list[str], go: str, timeout: float) -> str:
@@ -132,11 +153,23 @@ class UciEngine:
         return parse_bestmove(self.wait_for(lambda line: line.startswith("bestmove"), "bestmove", timeout))
 
     def close(self) -> None:
+        if self.process is None:
+            return
         if self.process.poll() is None:
-            try: self.send("quit")
-            except GauntletError: pass
+            try:
+                if self.process.stdin:
+                    self.process.stdin.write("quit\n")
+                    self.process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
             try: self.process.wait(timeout=1)
-            except subprocess.TimeoutExpired: self.process.kill(); self.process.wait()
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if stream:
+                try: stream.close()
+                except OSError: pass
 
 # Minimal legal-move implementation: the harness, rather than an engine, adjudicates games.
 def sq(name: str) -> int: return FILES.index(name[0]) + 8 * (int(name[1]) - 1)
@@ -271,14 +304,38 @@ class Position:
             if king in next_position.board and not next_position.attacked(next_position.board.index(king), enemy): legal.append(move)
         return legal
 
+def repetition_identity(position: Position) -> tuple[str, str, str, str]:
+    """FIDE repetition identity, with EP only when a legal EP capture exists."""
+    ep = "-"
+    if position.ep is not None:
+        target = position.ep
+        captured = target + (-8 if position.turn == "w" else 8)
+        enemy_pawn = "p" if position.turn == "w" else "P"
+        if position.board[target] == "." and 0 <= captured < 64 and position.board[captured] == enemy_pawn:
+            target_name = name(target)
+            for move in position.legal_moves():
+                source = sq(move[:2])
+                if move[2:4] == target_name and position.board[source].lower() == "p":
+                    ep = target_name
+                    break
+    return (position.fen().split()[0], position.turn, position.castling or "-", ep)
+
+
 def play_game(game: PairGame, rookery: UciEngine, opponent: UciEngine, go: str, response_timeout: float, max_plies: int) -> dict:
     position=Position.from_fen(game.opening.fen); moves=[]; seen=Counter()
     while len(moves) < max_plies:
         legal=position.legal_moves()
         if not legal:
-            result="0-1" if position.turn=="w" and position.attacked(position.board.index("K" if position.turn=="w" else "k"), "b" if position.turn=="w" else "w") else "1-0" if position.turn=="b" else "1/2-1/2"
-            return game_record(game,moves,result,"checkmate" if result!="1/2-1/2" else "stalemate")
-        key=" ".join(position.fen().split()[:4]); seen[key]+=1
+            king = "K" if position.turn == "w" else "k"
+            enemy = "b" if position.turn == "w" else "w"
+            if position.attacked(position.board.index(king), enemy):
+                result = "0-1" if position.turn == "w" else "1-0"
+                termination = "checkmate"
+            else:
+                result = "1/2-1/2"
+                termination = "stalemate"
+            return game_record(game,moves,result,termination)
+        key=repetition_identity(position); seen[key]+=1
         if seen[key]>=3: return game_record(game,moves,"1/2-1/2","threefold repetition")
         if position.halfmove>=100: return game_record(game,moves,"1/2-1/2","fifty-move rule")
         engine=rookery if (position.turn=="w") == game.rookery_white else opponent
@@ -326,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         if o: o.close()
     with (args.output_dir/"games.jsonl").open("w",encoding="utf-8") as output:
         for record in records: output.write(json.dumps(record,sort_keys=True)+"\n")
-    report={"format":"rookery-v2-gauntlet-v1","config":config,"aggregate":score_games(records),"completed_games":len(records),"scheduled_games":len(games),"error":error}
+    report={"format":"rookery-v2-gauntlet-v1","config":config,"aggregate":score_games(records),"completed_games":sum(record.get("status") == "completed" for record in records),"scheduled_games":len(games),"error":error}
     (args.output_dir/"report.json").write_text(json.dumps(report,sort_keys=True,indent=2)+"\n",encoding="utf-8")
     print(json.dumps(report["aggregate"],sort_keys=True))
     return 1 if error else 0
