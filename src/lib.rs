@@ -10,6 +10,7 @@ pub mod hash;
 pub mod movegen;
 pub mod position;
 pub mod search;
+pub mod web;
 
 pub use bitboard::{Bitboard, Color, Piece, PieceKind, Square, attacks};
 pub use position::Position;

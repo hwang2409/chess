@@ -11,6 +11,16 @@ cargo run --release
 
 The executable supports the UCI handshake, `isready`, `ucinewgame`, `position startpos` and `position fen ...` with move lists, `go depth N`, `go movetime N`, basic `wtime`/`btime` plus increments, `stop`, `quit`, and `go perft N` (root divide output followed by a total). Searches run on a worker thread; `stop` requests cancellation and the command loop emits one final `bestmove` after the worker completes.
 
+## Play in a browser
+
+Start the local board server (the existing `rookery` UCI binary is unchanged):
+
+```sh
+cargo run --bin rookery-web --release
+```
+
+Then open [http://127.0.0.1:7878](http://127.0.0.1:7878). The board is a self-contained, dependency-free frontend: select a White piece and a highlighted destination, choose promotions in the dialog, flip the orientation as desired, and choose engine search depth 1–6 before starting a new game. The server keeps one in-memory game session, exposes only `/`, `/style.css`, `/app.js`, and its JSON `/api/state`, `/api/new`, and `/api/move` endpoints, and is intended for local use.
+
 ## Implemented in v1
 
 - Board primitives, UCI coordinate-move parsing/formatting, and structural FEN parsing and serialization.
