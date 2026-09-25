@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 const INF: i32 = 32_000;
 const MATE: i32 = 30_000;
 const MAX_PLY: usize = 64;
+const TT_SIZE: usize = 1 << 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchResult {
@@ -16,11 +17,64 @@ pub struct SearchResult {
     pub nodes: u64,
 }
 
+#[derive(Clone, Copy)]
+enum Bound {
+    Exact,
+    Lower,
+    Upper,
+}
+
+#[derive(Clone, Copy)]
+struct TranspositionEntry {
+    key: u64,
+    history_key: u64,
+    depth: u8,
+    score: i32,
+    bound: Bound,
+    best_move: Option<Move>,
+}
+
+/// A fixed-size, direct-mapped table retained only for one iterative search.
+///
+/// Entries also carry a compact key for the current repetition path, so a
+/// bound is not reused with different draw history. Keeping the table scoped
+/// this way avoids carrying bounds across unrelated game histories while still
+/// allowing each deeper iteration to reuse completed work.
+struct TranspositionTable {
+    entries: Vec<Option<TranspositionEntry>>,
+}
+
+impl TranspositionTable {
+    fn new() -> Self {
+        Self {
+            entries: vec![None; TT_SIZE],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
+    fn get(&self, key: u64, history_key: u64) -> Option<TranspositionEntry> {
+        self.entries[key as usize & (TT_SIZE - 1)]
+            .filter(|entry| entry.key == key && entry.history_key == history_key)
+    }
+
+    fn store(&mut self, entry: TranspositionEntry) {
+        let slot = &mut self.entries[entry.key as usize & (TT_SIZE - 1)];
+        if slot.is_none_or(|old| entry.depth >= old.depth) {
+            *slot = Some(entry);
+        }
+    }
+}
+
 pub struct Searcher {
     nodes: u64,
     deadline: Option<Instant>,
     aborted: bool,
     path: Vec<u64>,
+    tt: TranspositionTable,
+    tt_enabled: bool,
 }
 
 impl Searcher {
@@ -30,9 +84,22 @@ impl Searcher {
             deadline: None,
             aborted: false,
             path: Vec::new(),
+            tt: TranspositionTable::new(),
+            tt_enabled: true,
         }
     }
-    pub fn clear(&mut self) {}
+
+    #[cfg(test)]
+    fn without_transposition_table() -> Self {
+        Self {
+            tt_enabled: false,
+            ..Self::new()
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.tt.clear();
+    }
 
     pub fn search(
         &mut self,
@@ -55,6 +122,7 @@ impl Searcher {
         self.nodes = 0;
         self.aborted = false;
         self.deadline = limit.and_then(|d| Instant::now().checked_add(d));
+        self.tt.clear();
         self.path.clear();
         let reversible_history_len = usize::from(position.halfmove_clock());
         self.path
@@ -116,7 +184,7 @@ impl Searcher {
         p: &mut Position,
         depth: u8,
         mut alpha: i32,
-        beta: i32,
+        mut beta: i32,
         ply: usize,
     ) -> i32 {
         self.nodes += 1;
@@ -128,14 +196,43 @@ impl Searcher {
         }
         // Checkmate and stalemate take precedence over draw claims at this node.
         let check = in_check(p, p.side_to_move());
-        let moves = legal_moves(p);
+        let mut moves = legal_moves(p);
         if moves.is_empty() {
             return if check { -MATE + ply as i32 } else { 0 };
         }
         if self.is_repetition() || p.halfmove_clock() >= 100 {
             return 0;
         }
+
+        let key = p.zobrist_hash();
+        let history_key = self.repetition_path_key();
+        let tt_entry = self
+            .tt_enabled
+            .then(|| self.tt.get(key, history_key))
+            .flatten();
+        if let Some(entry) = tt_entry {
+            if entry.depth >= depth {
+                let score = score_from_tt(entry.score, ply);
+                match entry.bound {
+                    Bound::Exact => return score,
+                    Bound::Lower => alpha = alpha.max(score),
+                    Bound::Upper => beta = beta.min(score),
+                }
+                if alpha >= beta {
+                    return score;
+                }
+            }
+            if let Some(best_move) = entry.best_move
+                && let Some(index) = moves.iter().position(|mv| *mv == best_move)
+            {
+                moves.swap(0, index);
+            }
+        }
+
+        let alpha_bound = alpha;
+        let beta_bound = beta;
         let mut best = -INF;
+        let mut best_move = None;
         for mv in moves {
             let undo = p.make_move(mv);
             self.path.push(repetition_key(p));
@@ -145,11 +242,32 @@ impl Searcher {
             if self.aborted {
                 return 0;
             }
-            best = best.max(score);
+            if score > best {
+                best = score;
+                best_move = Some(mv);
+            }
             alpha = alpha.max(score);
             if alpha >= beta {
                 break;
             }
+        }
+
+        if self.tt_enabled {
+            let bound = if best <= alpha_bound {
+                Bound::Upper
+            } else if best >= beta_bound {
+                Bound::Lower
+            } else {
+                Bound::Exact
+            };
+            self.tt.store(TranspositionEntry {
+                key,
+                history_key,
+                depth,
+                score: score_to_tt(best, ply),
+                bound,
+                best_move,
+            });
         }
         best
     }
@@ -206,6 +324,12 @@ impl Searcher {
         alpha
     }
 
+    fn repetition_path_key(&self) -> u64 {
+        self.path.iter().fold(0, |key, position_key| {
+            key.wrapping_add(mix_history_key(*position_key))
+        })
+    }
+
     fn is_repetition(&self) -> bool {
         self.path.last().is_some_and(|key| {
             self.path
@@ -233,6 +357,34 @@ impl Searcher {
 impl Default for Searcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn mix_history_key(mut key: u64) -> u64 {
+    key ^= key >> 30;
+    key = key.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    key ^= key >> 27;
+    key = key.wrapping_mul(0x94d0_49bb_1331_11eb);
+    key ^ (key >> 31)
+}
+
+fn score_to_tt(score: i32, ply: usize) -> i32 {
+    if score > MATE - MAX_PLY as i32 {
+        score + ply as i32
+    } else if score < -MATE + MAX_PLY as i32 {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+fn score_from_tt(score: i32, ply: usize) -> i32 {
+    if score > MATE - MAX_PLY as i32 {
+        score - ply as i32
+    } else if score < -MATE + MAX_PLY as i32 {
+        score + ply as i32
+    } else {
+        score
     }
 }
 
@@ -280,7 +432,7 @@ fn evaluate(p: &Position) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Searcher;
+    use super::{MATE, Searcher, score_from_tt, score_to_tt};
     use crate::movegen::legal_moves;
     use crate::{Position, hash};
     use std::time::Duration;
@@ -403,6 +555,29 @@ mod tests {
         // Black to move is stalemated in this position.
         let mut p = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
         assert_eq!(Searcher::new().quiescence(&mut p, -32_000, 32_000, 1), 0);
+    }
+
+    #[test]
+    fn transposition_table_mate_scores_are_ply_normalized() {
+        assert_eq!(score_from_tt(score_to_tt(MATE - 9, 7), 7), MATE - 9);
+        assert_eq!(score_from_tt(score_to_tt(-MATE + 9, 7), 7), -MATE + 9);
+        assert_eq!(score_from_tt(score_to_tt(MATE - 9, 7), 3), MATE - 5);
+        assert_eq!(score_from_tt(score_to_tt(-MATE + 9, 7), 3), -MATE + 5);
+    }
+
+    #[test]
+    fn transposition_table_preserves_result_and_reduces_nodes() {
+        let mut with_tt_position = Position::startpos();
+        let with_tt = Searcher::new().search(&mut with_tt_position, 4, None);
+        let mut without_tt_position = Position::startpos();
+        let without_tt =
+            Searcher::without_transposition_table().search(&mut without_tt_position, 4, None);
+
+        assert_eq!(with_tt.depth, without_tt.depth);
+        assert_eq!(with_tt.score, without_tt.score);
+        assert_eq!(with_tt.best_move, without_tt.best_move);
+        assert_eq!(with_tt_position, without_tt_position);
+        assert!(with_tt.nodes < without_tt.nodes);
     }
 
     #[test]
