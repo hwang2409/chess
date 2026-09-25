@@ -98,14 +98,23 @@ impl Position {
             _ => return Err("invalid active color".into()),
         };
         if fields[2] != "-" {
+            let mut previous_right = 0;
             for ch in fields[2].chars() {
-                p.castling |= match ch {
+                let right = match ch {
                     'K' => WHITE_KINGSIDE,
                     'Q' => WHITE_QUEENSIDE,
                     'k' => BLACK_KINGSIDE,
                     'q' => BLACK_QUEENSIDE,
                     _ => return Err("invalid castling rights".into()),
                 };
+                if p.castling & right != 0 {
+                    return Err("duplicate castling right".into());
+                }
+                if right < previous_right {
+                    return Err("castling rights must be in canonical KQkq order".into());
+                }
+                p.castling |= right;
+                previous_right = right;
             }
         }
         p.en_passant = if fields[3] == "-" {
